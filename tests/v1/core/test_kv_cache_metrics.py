@@ -225,3 +225,28 @@ def test_kv_cache_metrics_collector_smoke() -> None:
     assert abs(event.idle_seconds - 1.0) < 1e-6
     # One reuse gap between the two accesses.
     assert event.reuse_gaps_seconds == (1.0,)
+
+
+def test_id_collision_between_granularities_does_not_cross_talk():
+    """Hierarchical pools report BOTH large and small blocks, whose numeric
+    ids collide. The collector must key by object identity: a large block
+    with state-slot id 5 and a small attention block with id 5 are
+    different blocks with different lifetimes."""
+    from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+    collector = KVCacheMetricsCollector(sample_rate=1.0)
+    large = KVCacheBlock(5)
+    small = KVCacheBlock(5)
+
+    collector.on_block_allocated(large)
+    collector.on_block_allocated(small)
+    assert len(collector.block_metrics) == 2  # bare-id keying would give 1
+
+    collector.on_block_accessed(large)
+    # Evicting the SMALL block must not pop the large block's state.
+    collector.on_block_evicted(small)
+    assert len(collector.block_metrics) == 1
+    collector.on_block_evicted(large)
+    assert len(collector.block_metrics) == 0
+    assert len(collector._eviction_events) == 2
