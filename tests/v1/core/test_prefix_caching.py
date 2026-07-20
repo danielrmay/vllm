@@ -4310,3 +4310,76 @@ def test_swa_shared_prefix_reuse_under_zero_retention(monkeypatch):
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+def test_mamba_split_state_aligned_preserves_fine_tail():
+    """State-aligned splitting (offload-active geometry) must coarsen only the
+    mid-chunk step cadence; the LAST cacheable boundary stays on the fine
+    block grid. Otherwise the tail chunk runs past it to an unaligned end and
+    the final state becomes uncacheable - silently degrading later resumes
+    (and, with offloading, feeding stale state bytes into the CPU tier)."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    block_size = 16
+    factor = 50  # state span = 800 tokens
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        # The split reads the spec-derived factor (cache_config's copy is
+        # only stamped in the worker process and stays 1 scheduler-side).
+        mamba_large_block_factor=factor,
+        use_eagle=False,
+        hash_block_size=block_size,
+        mamba_partial_cache_hit=False,
+        mamba_split_state_aligned=True,
+    )
+    request = SimpleNamespace(
+        num_computed_tokens=3200,
+        num_prompt_tokens=3953,
+        num_tokens=3953,
+        shared_prefix_boundary=0,
+    )
+    # Tail chunk: must stop at the FINE last-cache boundary (3952), never run
+    # to 3953 (unaligned end -> the step's state cannot be cached).
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            self=mock, request=request, num_new_tokens=753
+        )
+        == 752
+    )
+    # Mid-chunk steering stays coarse: from 0 with budget 2048, stop at 1600.
+    request.num_computed_tokens = 0
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            self=mock, request=request, num_new_tokens=2048
+        )
+        == 1600
+    )
+    # Budget too small to reach the next coarse boundary mid-request: degrade
+    # to fine-grid progress instead of stalling at zero.
+    request.num_computed_tokens = 3200
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            self=mock, request=request, num_new_tokens=400
+        )
+        == 400
+    )
+    # A chunk heading into the fine tail must stop at the LAST coarse
+    # (state-span) boundary first, or that offloadable state never
+    # materializes: start 3200, prompt 4347 (fine tail 4336, last span 4000),
+    # budget reaching past the end -> stop at 4000.
+    request.num_prompt_tokens = request.num_tokens = 4347
+    request.num_computed_tokens = 3200
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            self=mock, request=request, num_new_tokens=1148
+        )
+        == 800
+    )
+    # And the following chunk stops at the fine tail boundary (4336).
+    request.num_computed_tokens = 4000
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            self=mock, request=request, num_new_tokens=348
+        )
+        == 336
+    )

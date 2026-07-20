@@ -27,9 +27,32 @@ from tests.utils import create_new_process_for_each_test
 from vllm import LLM, SamplingParams
 from vllm.platforms import current_platform
 
-# Reliable cache evidence: the prefix-cache prometheus
+# Reliable evidence: the offloading transfer-bytes prometheus
 # counters lose most per-step worker metadata (upstream observability gap),
-# so tests assert on engine-reported cached-token counts instead.
+# so cache-hit tests assert on engine-reported cached-token counts and the
+# offload tests count actual worker submissions.
+_transfer_counts = {"load": 0, "store": 0}
+
+
+def _count_transfers() -> dict:
+    from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+
+    _transfer_counts["load"] = 0
+    _transfer_counts["store"] = 0
+    orig_load = CPUOffloadingWorker.submit_load
+    orig_store = CPUOffloadingWorker.submit_store
+
+    def submit_load(self, *a, **k):
+        _transfer_counts["load"] += 1
+        return orig_load(self, *a, **k)
+
+    def submit_store(self, *a, **k):
+        _transfer_counts["store"] += 1
+        return orig_store(self, *a, **k)
+
+    CPUOffloadingWorker.submit_load = submit_load
+    CPUOffloadingWorker.submit_store = submit_store
+    return _transfer_counts
 
 
 @pytest.fixture(autouse=True)
@@ -214,5 +237,156 @@ def test_concurrent_multi_session_needle_recall():
                 f"session {i}: only {out.num_cached_tokens}/{prompt_len} "
                 "prompt tokens came from cache on resume"
             )
+    finally:
+        _shutdown(llm)
+
+
+@skip_unsupported
+@create_new_process_for_each_test()
+def test_concurrent_resume_with_cpu_offload():
+    """With CPU offloading enabled, evicted align checkpoints must be served
+    back from the CPU tier: after a churn wave that overflows the GPU pool,
+    every resumed session must still recall its OWN needle exactly AND get a
+    cache-served resume (GPU trail or CPU tier) instead of a full recompute."""
+    transfers = _count_transfers()
+    needles = [f"needle-{i}-{'zqxjkvbw'[i]}{i * 13 + 7}" for i in range(NUM_SESSIONS)]
+    primes = [
+        _filler(f"ctx{i}", 800)
+        + f" The secret codeword is {needles[i]}. "
+        + _filler(f"tail{i}", 2500)
+        for i in range(NUM_SESSIONS)
+    ]
+    resumes = [
+        p + " Repeat the secret codeword exactly: the secret codeword is"
+        for p in primes
+    ]
+
+    llm = LLM(
+        model=MODEL,
+        block_size=BLOCK_SIZE,
+        mamba_cache_mode="align",
+        enable_prefix_caching=True,
+        enforce_eager=True,
+        gpu_memory_utilization=0.35,
+        max_model_len=8192,
+        max_num_batched_tokens=2048,
+        max_num_seqs=NUM_SESSIONS,
+        kv_offloading_size=4.0,
+        kv_offloading_backend="native",
+        disable_log_stats=False,
+    )
+    try:
+        llm.generate(primes, SamplingParams(temperature=0.0, max_tokens=4))
+        assert transfers["store"] > 0, "priming offloaded nothing to the CPU tier"
+        # Drop the entire GPU prefix cache so the resumes CANNOT be served
+        # from the GPU trail: any cache-served token below must have come
+        # through a real CPU->GPU reload. In-flight offload stores hold GPU
+        # blocks, so pump the engine until the reset succeeds.
+        for _ in range(60):
+            if llm.reset_prefix_cache():
+                break
+            llm.generate(["."], SamplingParams(temperature=0.0, max_tokens=1))
+        else:
+            raise AssertionError(
+                "reset_prefix_cache never succeeded (stores stuck in flight?)"
+            )
+        outs = llm.generate(resumes, SamplingParams(temperature=0.0, max_tokens=24))
+        failures = []
+        for i, out in enumerate(outs):
+            text = out.outputs[0].text
+            if needles[i] not in text:
+                failures.append((i, needles[i], text.strip()[:60]))
+        assert not failures, f"own-needle recall failed (state poison?): {failures}"
+        for i, out in enumerate(outs):
+            prompt_len = len(out.prompt_token_ids)
+            assert out.num_cached_tokens >= 0.9 * prompt_len, (
+                f"session {i}: only {out.num_cached_tokens}/{prompt_len} cached "
+                "on resume - CPU tier did not serve the evicted checkpoints"
+            )
+        # The cached tokens above must have been RELOADED, not GPU-resident:
+        # a zero here means the offload path is inert and the test is
+        # vacuously green.
+        assert transfers["load"] > 0, (
+            "no CPU->GPU load was ever submitted - resumes were not served "
+            "by the CPU tier"
+        )
+    finally:
+        _shutdown(llm)
+
+
+@skip_unsupported
+@create_new_process_for_each_test()
+def test_states_cached_after_reload_lineage_are_correct():
+    """States cached by a request whose mamba lineage began at a
+    CONNECTOR-LOADED state must be correct for later hits.
+
+    Isolated failure shape (single session, no concurrency, no second
+    reload): prime a context, drop the GPU trail, resume (correct - the
+    reloaded state + replay serves this request fine), then EXTEND the
+    context and re-prime it (this prefill consumes the reloaded-state
+    lineage and caches new states along the extension). A warm query of
+    the extended context must still recall content from before the
+    original reload boundary. Regression: the re-primed lineage cached
+    states that lost the long-range past (fluent output, needle gone)."""
+    transfers = _count_transfers()
+    needle = "needle-zq77"
+    base = (
+        _filler("ctx", 800)
+        + f" The secret codeword is {needle}. "
+        + _filler("tail", 2200)
+    )
+    question = " Repeat the secret codeword exactly: the secret codeword is"
+    extended = base + " " + _filler("ext", 700)
+
+    llm = LLM(
+        model=MODEL,
+        block_size=BLOCK_SIZE,
+        mamba_cache_mode="align",
+        enable_prefix_caching=True,
+        enforce_eager=True,
+        gpu_memory_utilization=0.35,
+        max_model_len=8192,
+        max_num_batched_tokens=2048,
+        max_num_seqs=NUM_SESSIONS,
+        kv_offloading_size=4.0,
+        kv_offloading_backend="native",
+        disable_log_stats=False,
+    )
+    try:
+        llm.generate([base], SamplingParams(temperature=0.0, max_tokens=4))
+        for _ in range(60):
+            if llm.reset_prefix_cache():
+                break
+            llm.generate(["."], SamplingParams(temperature=0.0, max_tokens=1))
+        else:
+            raise AssertionError("reset_prefix_cache never succeeded")
+
+        # First resume: served through a real CPU->GPU reload; must recall.
+        out_a = llm.generate(
+            [base + question], SamplingParams(temperature=0.0, max_tokens=24)
+        )
+        assert needle in out_a[0].outputs[0].text, (
+            "first-generation reload already broken: "
+            f"{out_a[0].outputs[0].text.strip()[:60]!r}"
+        )
+
+        # Extend and re-prime: this prefill's mamba lineage starts at the
+        # reloaded state and caches new states along the extension.
+        llm.generate([extended], SamplingParams(temperature=0.0, max_tokens=4))
+
+        # Warm query through the re-primed lineage - no further reset, no
+        # further reload. The cached states must preserve the far past.
+        out_b = llm.generate(
+            [extended + question], SamplingParams(temperature=0.0, max_tokens=24)
+        )
+        assert needle in out_b[0].outputs[0].text, (
+            "states cached by the reload-descended re-prime lost the "
+            f"long-range past: {out_b[0].outputs[0].text.strip()[:60]!r}"
+        )
+        # The first resume must have actually gone through the CPU tier
+        # (or this whole test proves nothing).
+        assert transfers["load"] > 0, (
+            "no CPU->GPU load was ever submitted across the flow"
+        )
     finally:
         _shutdown(llm)

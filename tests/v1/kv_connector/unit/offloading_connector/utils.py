@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
 )
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
@@ -179,6 +180,8 @@ class RequestRunner:
         async_scheduling: bool = True,
         kv_cache_groups: list[KVCacheGroupSpec] | None = None,
         extra_config_overrides: dict[str, Any] | None = None,
+        max_num_batched_tokens: int = 1000,
+        wrap_multi_connector: bool = False,
     ):
         assert blocks_per_chunk == 1 or kv_cache_groups is None, (
             "blocks_per_chunk > 1 requires all groups to have the same "
@@ -194,7 +197,8 @@ class RequestRunner:
 
         vllm_config = create_vllm_config(
             block_size=block_size,
-            max_num_batched_tokens=1000,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=min(16, max_num_batched_tokens),
             disable_hybrid_kv_cache_manager=False,
         )
         vllm_config.scheduler_config.async_scheduling = async_scheduling
@@ -213,11 +217,28 @@ class RequestRunner:
         if extra_config_overrides:
             extra_config.update(extra_config_overrides)
 
-        vllm_config.kv_transfer_config = KVTransferConfig(
-            kv_connector="OffloadingConnector",
-            kv_role="kv_both",
-            kv_connector_extra_config=extra_config,
-        )
+        if wrap_multi_connector:
+            # Production-shaped MultiConnector nesting: sub-connector configs
+            # live in extra_config["connectors"].
+            vllm_config.kv_transfer_config = KVTransferConfig(
+                kv_connector="MultiConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config={
+                    "connectors": [
+                        {
+                            "kv_connector": "OffloadingConnector",
+                            "kv_role": "kv_both",
+                            "kv_connector_extra_config": extra_config,
+                        }
+                    ]
+                },
+            )
+        else:
+            vllm_config.kv_transfer_config = KVTransferConfig(
+                kv_connector="OffloadingConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config=extra_config,
+            )
         vllm_config.kv_events_config = KVEventsConfig(
             # Enable so the offloading events tracker is active, but use the
             # null publisher: these tests drain take_events directly and a
@@ -256,6 +277,17 @@ class RequestRunner:
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         self.num_kv_groups = len(kv_cache_config.kv_cache_groups)
 
+        # Mirror the front-end CLI flag: --mamba-cache-mode lands on
+        # cache_config in every process. The hierarchy factor is deliberately
+        # NOT mirrored: in production it is stamped on cache_config only in
+        # the WORKER process (_align_hybrid_block_size), so scheduler-side
+        # code must learn it from kv_cache_config's specs, like this harness'
+        # scheduler does.
+        for group in kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, MambaSpec):
+                vllm_config.cache_config.mamba_cache_mode = spec.mamba_cache_mode
+
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
@@ -270,16 +302,42 @@ class RequestRunner:
             hash_block_size=hash_block_size,
         )
 
+        # The worker side is constructed directly as an OffloadingConnector;
+        # when the scheduler side is MultiConnector-wrapped, hand the worker
+        # the SUB-connector config (mirroring MultiConnector's own
+        # per-child temp-config construction).
+        worker_vllm_config = vllm_config
+        if wrap_multi_connector:
+            import copy as _copy
+
+            worker_vllm_config = _copy.copy(vllm_config)
+            assert vllm_config.kv_transfer_config is not None
+            sub = vllm_config.kv_transfer_config.kv_connector_extra_config[
+                "connectors"
+            ][0]
+            worker_vllm_config.kv_transfer_config = KVTransferConfig(
+                **sub, engine_id=vllm_config.kv_transfer_config.engine_id
+            )
         self.worker_connector = OffloadingConnector(
-            vllm_config, KVConnectorRole.WORKER, kv_cache_config
+            worker_vllm_config, KVConnectorRole.WORKER, kv_cache_config
         )
 
         # register worker kv_caches to enable OffloadingWorker creations
         # set_current_vllm_config is needed for get_kv_cache_layout() to work
-        kv_caches: dict[str, torch.Tensor] = {}
+        kv_caches: dict[str, torch.Tensor | list[torch.Tensor]] = {}
         for group in kv_cache_groups:
             spec = group.kv_cache_spec
             for layer_name in group.layer_names:
+                if isinstance(spec, MambaSpec):
+                    # Mamba layers register a LIST of state tensors with one
+                    # slot per state (per LARGE block when the pool is
+                    # hierarchical), matching worker canonicalization.
+                    num_state_slots = num_gpu_blocks // spec.large_block_factor
+                    elems = spec.state_page_size_bytes // spec.dtypes[0].itemsize
+                    kv_caches[layer_name] = [
+                        torch.zeros(num_state_slots, elems, dtype=spec.dtypes[0])
+                    ]
+                    continue
                 # Shape follows FlashAttention layout:
                 # Shape: (num_blocks, 2, block_size, num_kv_heads, head_size)
                 kv_caches[layer_name] = torch.empty(
@@ -294,10 +352,16 @@ class RequestRunner:
         with set_current_vllm_config(vllm_config):
             self.worker_connector.register_kv_caches(kv_caches)
 
-        # extract connector of scheduler
+        # extract connector of scheduler (unwrapping MultiConnector if used)
         scheduler_connector = self.scheduler.connector
         assert scheduler_connector is not None
-        assert isinstance(scheduler_connector, OffloadingConnector)
+        if not isinstance(scheduler_connector, OffloadingConnector):
+            subs = getattr(scheduler_connector, "_connectors", [])
+            offloading = [c for c in subs if isinstance(c, OffloadingConnector)]
+            assert offloading, (
+                f"no OffloadingConnector found in {type(scheduler_connector)}"
+            )
+            scheduler_connector = offloading[0]
         self.scheduler_connector: OffloadingConnector = scheduler_connector
 
         # extract mocked OffloadingManager of scheduler connector
@@ -313,7 +377,13 @@ class RequestRunner:
             self.connector_scheduler.config.kv_group_configs,
             kv_cache_config.kv_cache_groups,
         ):
-            tokens_per_block = kv_cache_group.kv_cache_spec.block_size
+            spec = kv_cache_group.kv_cache_spec
+            tokens_per_block = spec.block_size
+            if isinstance(spec, MambaSpec):
+                # One offloaded mamba "block" is one full state; under a
+                # hierarchical pool that state spans large_block_factor
+                # small blocks' worth of tokens.
+                tokens_per_block *= spec.large_block_factor
             assert group_config.tokens_per_block == tokens_per_block
             assert group_config.tokens_per_chunk == tokens_per_block * blocks_per_chunk
 
@@ -332,8 +402,12 @@ class RequestRunner:
         self.flushed_gpu_blocks: set[GPUBlock] = set()
         self.kv_connector_stats: list[Any] = []
 
-        # block_id -> GPUBlock
-        self.gpu_blocks: dict[int, GPUBlock] = {}
+        # (group_idx, block_id) -> GPUBlock (group-aware, same-step coherent)
+        self.gpu_blocks: dict[tuple[int, int], GPUBlock] = {}
+        # block_id -> GPUBlock, latest mapping wins. Only for FLUSH
+        # resolution, whose specs can reference ids already reused by a
+        # later request (legacy semantics).
+        self.gpu_blocks_flat: dict[int, GPUBlock] = {}
 
         init_none_hash(sha256)
         self._block_hasher = get_request_block_hasher(block_size, sha256)
@@ -376,16 +450,33 @@ class RequestRunner:
 
         self.scheduler.add_request(req)
 
+    def _gpu_blocks_of_spec(self, gpu_spec: GPULoadStoreSpec) -> list[GPUBlock]:
+        """Resolve a GPU spec's flat block-id list to GPUBlocks, group-aware.
+
+        Ids are only unique within their group (a hierarchical mamba LARGE id
+        can numerically collide with an attention small id), so each id is
+        resolved together with the group its segment belongs to.
+        """
+        gpu_blocks: list[GPUBlock] = []
+        block_pos = 0
+        for group_idx, group_size in enumerate(gpu_spec.group_sizes):
+            for _ in range(group_size):
+                block_id = gpu_spec.block_ids[block_pos].item()
+                gpu_blocks.append(self.gpu_blocks[(group_idx, block_id)])
+                block_pos += 1
+        assert block_pos == len(gpu_spec.block_ids)
+        return gpu_blocks
+
     def _parse_transfers(self):
         for src_spec, dst_spec in self.offloading_spec.get_flushed_transfers():
             if isinstance(src_spec, GPULoadStoreSpec):
                 # store flush
                 for block_id in src_spec.block_ids:
-                    self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
+                    self.flushed_gpu_blocks.add(self.gpu_blocks_flat[block_id.item()])
             else:
                 # load flush
                 for block_id in dst_spec.block_ids:
-                    self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
+                    self.flushed_gpu_blocks.add(self.gpu_blocks_flat[block_id.item()])
 
         blocks_per_chunk = self.blocks_per_chunk
 
@@ -403,9 +494,7 @@ class RequestRunner:
             assert isinstance(gpu_spec, GPULoadStoreSpec)
             assert len(gpu_spec.group_sizes) == self.num_kv_groups
 
-            gpu_blocks: list[GPUBlock] = []
-            for block_id in gpu_spec.block_ids:
-                gpu_blocks.append(self.gpu_blocks[block_id.item()])
+            gpu_blocks: list[GPUBlock] = self._gpu_blocks_of_spec(gpu_spec)
 
             # list of (offload_key, sub_block_offset)
             offload_addresses: list[Any] = []
@@ -455,7 +544,12 @@ class RequestRunner:
         ):
             for blocks in manager.req_to_blocks.values():
                 for block_idx, block in enumerate(blocks):
-                    self.gpu_blocks[block.block_id] = GPUBlock(group_idx, block_idx)
+                    # Keyed per group: ids are only unique within a group
+                    # (hierarchical mamba LARGE ids collide numerically with
+                    # attention small ids).
+                    gpu_block = GPUBlock(group_idx, block_idx)
+                    self.gpu_blocks[(group_idx, block.block_id)] = gpu_block
+                    self.gpu_blocks_flat[block.block_id] = gpu_block
 
     def _run(
         self,
@@ -491,7 +585,16 @@ class RequestRunner:
 
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
-            assert isinstance(kv_connector_metadata, OffloadingConnectorMetadata)
+            if not isinstance(kv_connector_metadata, OffloadingConnectorMetadata):
+                # MultiConnector wraps per-child metadata; extract ours.
+                subs = getattr(kv_connector_metadata, "metadata", ())
+                offloading_meta = [
+                    m for m in subs if isinstance(m, OffloadingConnectorMetadata)
+                ]
+                assert offloading_meta, (
+                    f"no OffloadingConnectorMetadata in {type(kv_connector_metadata)}"
+                )
+                kv_connector_metadata = offloading_meta[0]
 
             self.worker_connector.handle_preemptions(kv_connector_metadata)
 
@@ -508,6 +611,13 @@ class RequestRunner:
                 self.worker_connector.build_connector_worker_meta()
                 or OffloadingWorkerMetadata()
             )
+            if self.scheduler.connector is not self.scheduler_connector:
+                # MultiConnector scheduler side expects wrapped worker meta.
+                from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (  # noqa: E501
+                    MultiKVConnectorWorkerMetadata,
+                )
+
+                worker_meta = MultiKVConnectorWorkerMetadata(metadata=(worker_meta,))
 
             self.worker_connector.clear_connector_metadata()
 
@@ -623,7 +733,10 @@ class RequestRunner:
                 loaded_gpu_blocks.add(gpu_block)
                 assert gpu_block == self.offloaded[offloaded_address]
 
-        assert set(expected_loaded_gpu_blocks) == loaded_gpu_blocks
+        assert set(expected_loaded_gpu_blocks) == loaded_gpu_blocks, (
+            f"loaded mismatch: expected={sorted(expected_loaded_gpu_blocks, key=repr)} "
+            f"actual={sorted(loaded_gpu_blocks, key=repr)}"
+        )
         self.completed_loads.clear()
 
         stored_gpu_blocks: set[GPUBlock] = set()
@@ -634,10 +747,17 @@ class RequestRunner:
                 stored_gpu_blocks.add(gpu_block)
                 self.offloaded[offloaded_address] = gpu_block
 
-        assert set(expected_stored_gpu_blocks) == stored_gpu_blocks
+        assert set(expected_stored_gpu_blocks) == stored_gpu_blocks, (
+            f"stored mismatch: expected={sorted(expected_stored_gpu_blocks, key=repr)} "
+            f"actual={sorted(stored_gpu_blocks, key=repr)}"
+        )
         self.completed_stores.clear()
 
-        assert set(expected_flushed_gpu_blocks) == self.flushed_gpu_blocks
+        assert set(expected_flushed_gpu_blocks) == self.flushed_gpu_blocks, (
+            "flushed mismatch: "
+            f"expected={sorted(expected_flushed_gpu_blocks, key=repr)} "
+            f"actual={sorted(self.flushed_gpu_blocks, key=repr)}"
+        )
         self.flushed_gpu_blocks.clear()
 
 
@@ -652,6 +772,8 @@ def request_runner():
         blocks_per_chunk=1,
         kv_cache_groups=None,
         extra_config_overrides=None,
+        max_num_batched_tokens=1000,
+        wrap_multi_connector=False,
     ):
         runner = RequestRunner(
             block_size=block_size,
@@ -660,6 +782,8 @@ def request_runner():
             async_scheduling=async_scheduling,
             kv_cache_groups=kv_cache_groups,
             extra_config_overrides=extra_config_overrides,
+            max_num_batched_tokens=max_num_batched_tokens,
+            wrap_multi_connector=wrap_multi_connector,
         )
         runners.append(runner)
         return runner
