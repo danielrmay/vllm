@@ -5,7 +5,13 @@
 from typing import TYPE_CHECKING
 
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+)
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
     OffloadingConfig,
@@ -36,13 +42,34 @@ def build_offloading_config(
     engine_id = kv_transfer_config.engine_id
 
     parallel_config = vllm_config.parallel_config
+    # Upstream removed prefill context parallelism (#46570); only the
+    # decode factor scales the per-block token count now.
+    context_parallel_factor = parallel_config.decode_context_parallel_size
+
+    def _group_tokens_per_block(spec: KVCacheSpec) -> int:
+        tokens = spec.block_size * context_parallel_factor
+        if isinstance(spec, MambaSpec):
+            # On a hierarchical pool one mamba state spans large_block_factor
+            # allocation blocks; the offloaded unit is the full state, so the
+            # group's block cadence is the state cadence (factor == 1 keeps
+            # the legacy flat behaviour).
+            tokens *= spec.large_block_factor
+        return tokens
+
+    def _group_kv_bytes_per_block(group: KVCacheGroupSpec) -> int:
+        spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec):
+            # One offloaded mamba block is one full state.
+            layer_bytes = spec.state_page_size_bytes
+        else:
+            layer_bytes = spec.page_size_bytes
+        return layer_bytes * len(group.layer_names)
+
     groups = tuple(
         OffloadingGroupConfig(
-            tokens_per_block=(
-                group.kv_cache_spec.block_size
-                * parallel_config.decode_context_parallel_size
-            ),
+            tokens_per_block=_group_tokens_per_block(group.kv_cache_spec),
             layer_names=tuple(group.layer_names),
+            kv_bytes_per_block=_group_kv_bytes_per_block(group),
         )
         for group in kv_cache_config.kv_cache_groups
     )

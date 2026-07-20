@@ -106,10 +106,18 @@ class OffloadingConnectorWorker:
                         dtype=torch.int8,
                         device=layer_kv_cache.device,
                     ).set_(layer_kv_cache.untyped_storage())
+                    # A SHARED hybrid storage can be sized by its mamba
+                    # occupancy and fall short of num_blocks * page; clamp
+                    # the view to the rows the storage actually holds
+                    # (mirrors the state-slot view below).
+                    num_rows = min(
+                        num_blocks,
+                        (raw.numel() - byte_offset) // block_stride_bytes,
+                    )
                     tensors_per_block[layer_name] = (
                         torch.as_strided(
                             raw,
-                            (num_blocks, page),
+                            (num_rows, page),
                             (block_stride_bytes, 1),
                             byte_offset,
                         ),
@@ -123,26 +131,38 @@ class OffloadingConnectorWorker:
                     state_tensors = kv_caches[layer_name]
                     assert isinstance(state_tensors, list)
 
-                    # re-construct the raw (num_blocks, page_size) tensor
-                    # from the first state tensor
+                    # Re-construct the raw block-major tensor from the first
+                    # state tensor. The offloaded unit is one full STATE: on a
+                    # hierarchical pool (large_block_factor > 1) each state
+                    # spans that many allocation blocks and is addressed by
+                    # its LARGE id, so the canonical view has one row per
+                    # state slot of state_page_size_bytes (in flat mode this
+                    # equals the legacy (num_blocks, page_size) view).
                     assert len(state_tensors) > 0
                     first_state_tensor = state_tensors[0]
                     assert first_state_tensor.storage_offset() == 0
-                    tensor = (
+                    num_state_slots = (
+                        num_blocks // layer_kv_cache_spec.large_block_factor
+                    )
+                    state_page = layer_kv_cache_spec.state_page_size_bytes
+                    # as_strided rather than view: the pool's small-block
+                    # count need not be factor-aligned, so the storage can
+                    # carry a sub-slot remainder no large block ever maps to.
+                    tensor = torch.as_strided(
                         torch.tensor(
                             [],
                             dtype=torch.int8,
                             device=first_state_tensor.device,
-                        )
-                        .set_(first_state_tensor.untyped_storage())
-                        .view((num_blocks, layer_kv_cache_spec.page_size_bytes))
+                        ).set_(first_state_tensor.untyped_storage()),
+                        (num_state_slots, state_page),
+                        (state_page, 1),
                     )
                     tensors_per_block[layer_name] = (tensor,)
 
-                    page_size_bytes[layer_name] = layer_kv_cache_spec.page_size_bytes
+                    page_size_bytes[layer_name] = state_page
                     unpadded_page_size_bytes[layer_name] = replace(
                         layer_kv_cache_spec, page_size_padded=None
-                    ).page_size_bytes
+                    ).state_page_size_bytes
 
                 else:
                     raise NotImplementedError
@@ -188,33 +208,55 @@ class OffloadingConnectorWorker:
             if not tensor_layer_names:
                 continue
 
-            # verify all layers in the group reference the exact same tensors
+            # verify all layers reference the same number of tensors
             assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
-            assert (
-                len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
-                == 1
-            )
-            assert (
-                len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
-            )
 
-            # pick the first layer to represent the group
-            first_layer_name = tensor_layer_names[0]
-            for tensor in tensors_per_block[first_layer_name]:
-                block_tensors.append(
-                    CanonicalKVCacheTensor(
-                        tensor=tensor,
-                        page_size_bytes=page_size_bytes[first_layer_name],
-                    )
-                )
-
-                curr_tensor_idx = len(block_tensors) - 1
+            # A shared storage can legitimately carry more than one canonical
+            # VIEW: in hybrid models with a hierarchical mamba pool, the
+            # attention layers view it small-page-major while the mamba
+            # layers view it state-slot-major. Emit one canonical tensor per
+            # distinct (data_ptr, shape, stride) signature and point each
+            # layer's data-ref at its own signature's tensor. Flat models
+            # collapse to a single signature, preserving legacy behaviour.
+            num_tensors = len(tensors_per_block[tensor_layer_names[0]])
+            for tensor_pos in range(num_tensors):
+                signature_to_idx: dict[tuple, int] = {}
                 for layer_name in tensor_layer_names:
+                    tensor = tensors_per_block[layer_name][tensor_pos]
+                    signature = (
+                        tensor.data_ptr(),
+                        tuple(tensor.shape),
+                        tuple(tensor.stride()),
+                    )
+                    curr_tensor_idx = signature_to_idx.get(signature)
+                    if curr_tensor_idx is None:
+                        block_tensors.append(
+                            CanonicalKVCacheTensor(
+                                tensor=tensor,
+                                page_size_bytes=page_size_bytes[layer_name],
+                            )
+                        )
+                        curr_tensor_idx = len(block_tensors) - 1
+                        signature_to_idx[signature] = curr_tensor_idx
                     block_data_refs[layer_name].append(
                         CanonicalKVCacheRef(
                             tensor_idx=curr_tensor_idx,
                             page_size_bytes=(unpadded_page_size_bytes[layer_name]),
                         )
+                    )
+                if len({sig[0] for sig in signature_to_idx}) > 1:
+                    # Distinct data_ptrs inside one shared_by set means the
+                    # layers stopped aliasing a single storage — each would
+                    # get its own canonical tensor AND CPU mirror,
+                    # multiplying pinned memory. The hybrid-mamba case never
+                    # trips this (its signatures share one data_ptr, they
+                    # differ only in shape/stride). Kept as a warning: the
+                    # pinned-allocation guard catches the gross version.
+                    logger.warning_once(
+                        "KV offload: layers sharing a KV cache tensor "
+                        "resolved to %d distinct storages; per-layer CPU "
+                        "mirrors will be allocated.",
+                        len({sig[0] for sig in signature_to_idx}),
                     )
 
         group_data_refs: list[list[CanonicalKVCacheRef]] = []

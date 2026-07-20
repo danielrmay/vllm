@@ -14,6 +14,10 @@ class OffloadingGroupConfig:
     tokens_per_block: int
     # Layer names belonging to this group.
     layer_names: tuple[str, ...]
+    # Per-worker bytes of ONE of this group's blocks across its layers.
+    # 0 means unknown (legacy uniform sizing applies). Groups can differ
+    # when block cadences differ (e.g. hierarchical mamba state blocks).
+    kv_bytes_per_block: int = 0
 
 
 @dataclass(frozen=True)

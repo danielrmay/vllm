@@ -94,6 +94,13 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # Number of scheduler-side allocation blocks per offloaded block of this
+    # group. 1 for attention (ids arrive at block cadence). For mamba on a
+    # hierarchical pool this is large_block_factor: the KV manager's per-group
+    # block-id lists are small-granular, with each state's LARGE id parked at
+    # the last slot of its span (nulls elsewhere), so incoming ids are
+    # downsampled to span-end entries at ingestion.
+    small_blocks_per_block: int = 1
 
 
 def get_sliding_window_size_in_chunks(
@@ -198,6 +205,12 @@ class SchedulerOffloadConfig(NamedTuple):
                 sorted(eagle_groups),
             )
 
+        def _small_blocks_per_block(idx: int) -> int:
+            kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            if isinstance(kv_spec, MambaSpec):
+                return kv_spec.large_block_factor
+            return 1
+
         return cls(
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=tuple(
@@ -222,6 +235,7 @@ class SchedulerOffloadConfig(NamedTuple):
                         kv_cache_config.kv_cache_groups[idx]
                     ),
                     is_eagle_group=idx in eagle_groups,
+                    small_blocks_per_block=_small_blocks_per_block(idx),
                 )
                 for idx, tokens_per_block in enumerate(spec.tokens_per_block)
             ),
@@ -234,6 +248,9 @@ class SchedulerOffloadConfig(NamedTuple):
 class RequestGroupState:
     offload_keys: list[OffloadKey] = field(default_factory=list)
     block_ids: list[int] = field(default_factory=list)
+    # Small-granular ids buffered until a full span completes, for groups
+    # with small_blocks_per_block > 1 (hierarchical mamba).
+    pending_small_block_ids: list[int] = field(default_factory=list)
     # Index of the next chunk to offload.
     next_stored_chunk_idx: int = 0
     # Number of offloaded chunks hit (including GPU prefix cache)
@@ -279,6 +296,19 @@ class RequestOffloadState:
                 "max_offload_tokens must be a non-negative int, got %r; ignoring", raw
             )
 
+    def clear_block_ids(self) -> None:
+        """Reset per-group GPU block-id state for a preempted request.
+
+        Both the downsampled list AND the pending partial-span buffer must
+        reset: the resume re-reports the full allocation from slot 0, and
+        stale buffer residue would phase-shift every subsequent span-end
+        emission onto null padding slots (silently ending all mamba stores
+        for the request's remaining lifetime).
+        """
+        for group_state in self.group_states:
+            group_state.block_ids.clear()
+            group_state.pending_small_block_ids.clear()
+
     def update_offload_keys(self) -> None:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
@@ -302,8 +332,25 @@ class RequestOffloadState:
             return
 
         assert len(new_block_id_groups) == len(self.group_states)
-        for group_state, new_blocks in zip(self.group_states, new_block_id_groups):
-            group_state.block_ids.extend(new_blocks)
+        for group_config, group_state, new_blocks in zip(
+            self.config.kv_group_configs, self.group_states, new_block_id_groups
+        ):
+            stride = group_config.small_blocks_per_block
+            if stride == 1:
+                group_state.block_ids.extend(new_blocks)
+                continue
+            # Hierarchical mamba: incoming ids are small-granular; one
+            # offloaded block per span of ``stride`` small slots, with the
+            # real (large) id parked at the span's LAST slot. Buffer partial
+            # spans so increments need not be span-aligned.
+            buf = group_state.pending_small_block_ids
+            buf.extend(new_blocks)
+            num_complete = len(buf) // stride
+            if num_complete:
+                group_state.block_ids.extend(
+                    buf[span * stride + stride - 1] for span in range(num_complete)
+                )
+                del buf[: num_complete * stride]
 
     def storable_chunks(
         self, group_config: "GroupOffloadConfig", num_offloadable_tokens: int
@@ -396,7 +443,14 @@ class OffloadingConnectorScheduler:
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
-        # GPU block IDs allocated in the current engine step
+        # GPU block IDs allocated in the current engine step.
+        # KNOWN LIMITATION: this set (and _block_id_to_pending_jobs) keys on
+        # bare ids, but a hierarchical mamba group's LARGE ids share the
+        # numeric range with attention small ids. A collision can only zero
+        # or flush a pending entry it did not need to — a silently SKIPPED
+        # store / redundant flush (bounded cache loss), never a wrong-data
+        # store. Re-keying to (group_idx, id) — as the test harness already
+        # does — is the follow-up fix.
         self._current_batch_allocated_block_ids: set[int] = set()
         # if GPU prefix caching is enabled,
         # Track loaded chunks to avoid redundant loads.
@@ -799,11 +853,24 @@ class OffloadingConnectorScheduler:
                 block.block_id for block in group_blocks if block.block_id != 0
             )
 
+            stride = group_config.small_blocks_per_block
+            if stride > 1:
+                # Hierarchical mamba: the KV manager's allocation list is
+                # small-granular, with each state's real (large) block at the
+                # LAST slot of its span. Downsample to span-end entries so
+                # the per-chunk indexing below sees one entry per offloaded
+                # block (mirrors update_block_id_groups on the store side).
+                group_blocks = group_blocks[stride - 1 :: stride]
+
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk
             offload_keys = group_state.offload_keys
             num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
+            # Safe under mixed local+external hits: num_cached_tokens is the
+            # connector-rounded hit (resolve_mamba_align_size floors mamba
+            # groups to state cadence), so cdiv() here never exceeds the
+            # span-end entries the downsampled allocation actually delivered.
             assert len(group_blocks) >= num_gpu_blocks
             num_locally_computed_gpu_blocks = num_gpu_blocks
             # Skip null placeholder blocks (used for sliding window or mamba padding).
@@ -887,8 +954,7 @@ class OffloadingConnectorScheduler:
             req_status.update_offload_keys()
 
             if preempted:
-                for group_state in req_status.group_states:
-                    group_state.block_ids.clear()
+                req_status.clear_block_ids()
 
             if new_block_id_groups:
                 if self._sliding_window_groups:
