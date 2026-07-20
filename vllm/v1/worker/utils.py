@@ -538,9 +538,34 @@ def bind_kv_cache(
         forward_context[layer_name].kv_cache = kv_cache
 
 
+def resolve_uniform_cow_page_size(kv_cache_groups) -> int | None:
+    """Per-layer page size for worker-side CoW copies, or None if the
+    layers disagree. Group-level ``page_size_bytes`` must NOT be used here:
+    a ``UniformTypeKVCacheSpecs`` group reports the SUM over its member
+    layers, while the config allocates one tensor per layer at that
+    layer's own page — addressing those tensors by the aggregate would
+    mask or miscopy valid rows. Callers must refuse loudly (rather than
+    copy) when this returns None."""
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    leaf_pages: set[int] = set()
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            leaf_pages.update(
+                member.page_size_bytes for member in spec.kv_cache_specs.values()
+            )
+        else:
+            leaf_pages.add(spec.page_size_bytes)
+    if len(leaf_pages) == 1:
+        return leaf_pages.pop()
+    return None
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
     num_blocks: int,
+    page_size: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
 ) -> None:
     if not kv_cache_block_copies:
@@ -566,15 +591,49 @@ def copy_kv_cache_blocks_inplace(
     indices = async_tensor_h2d(indices_np, device=device)
     src_indices, dst_indices = indices.unbind(dim=1)
 
+    # Row-stride resolution per storage. A FULL-SIZE storage derives its
+    # stride from its own byte count (the legacy behavior): a packed layout
+    # storing k pages per block gets stride k * page_size, so block id i
+    # addresses the i-th BLOCK — viewing packed storages by the uniform
+    # ``page_size`` would address the i-th PAGE and corrupt copies. A
+    # storage whose derived stride would be SMALLER than one page cannot be
+    # a real layout (each block owns at least a page): that is the
+    # hierarchical mamba storage with a factor-remainder-short tail, which
+    # is viewed at ``page_size`` with copies past its range masked out —
+    # those block ids hold no data in that storage. ``page_size`` comes
+    # from the KV cache specs because deriving it from a short storage's
+    # byte count is ambiguous.
     for tensor in storage_tensors:
         assert tensor.device == device
         blocks = torch.empty(0, dtype=torch.uint8, device=device)
         blocks.set_(tensor.untyped_storage())
-        # Block-major backing storage: block i owns the contiguous byte range
-        # [i * page_size, (i + 1) * page_size).
-        assert blocks.numel() % num_blocks == 0
-        blocks = blocks.view(num_blocks, -1)
-        blocks[dst_indices] = blocks[src_indices]
+        numel = blocks.numel()
+        derived = numel // num_blocks if numel % num_blocks == 0 else 0
+        if derived >= page_size:
+            # Full-size storage (uniform or packed): exact row per block.
+            blocks = torch.as_strided(blocks, (num_blocks, derived), (derived, 1))
+            blocks[dst_indices] = blocks[src_indices]
+            continue
+        if numel > num_blocks * page_size:
+            # An oversized storage that does NOT divide evenly into blocks
+            # is an unknown layout (e.g. packed with end padding); the
+            # masked page path below would miscopy it the same way P1's
+            # uniform view miscopied packed layouts. Fail loudly instead.
+            raise ValueError(
+                f"KV storage of {numel} bytes exceeds {num_blocks} x "
+                f"{page_size}-byte pages but is not evenly divisible into "
+                "blocks; refusing page-granularity CoW copies on an "
+                "unknown layout."
+            )
+        num_rows = numel // page_size
+        blocks = torch.as_strided(blocks, (num_rows, page_size), (page_size, 1))
+        # The .all() device sync happens once per short storage per CoW
+        # batch — rare (prefill partial hits), never per decode step.
+        in_range = (src_indices < num_rows) & (dst_indices < num_rows)
+        if bool(in_range.all()):
+            blocks[dst_indices] = blocks[src_indices]
+        else:
+            blocks[dst_indices[in_range]] = blocks[src_indices[in_range]]
 
 
 def is_residual_scattered_for_sp(

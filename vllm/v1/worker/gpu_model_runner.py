@@ -229,7 +229,10 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.utils import (
+    is_residual_scattered_for_sp,
+    resolve_uniform_cow_page_size,
+)
 from vllm.v1.worker.workspace import lock_workspace
 
 from .utils import (
@@ -1197,9 +1200,15 @@ class GPUModelRunner(
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
         if scheduler_output.kv_cache_block_copies:
+            if self._cow_uniform_page_size is None:
+                raise NotImplementedError(
+                    "Partial-hit CoW copies are not supported when KV "
+                    "layers have heterogeneous per-layer page sizes."
+                )
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
+                self._cow_uniform_page_size,
                 scheduler_output.kv_cache_block_copies,
             )
 
@@ -7383,12 +7392,15 @@ class GPUModelRunner(
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     state_tensors = []
                     storage_offset_bytes = 0
+                    # In hierarchical mode (large_block_factor > 1), the mamba
+                    # view has one slot per ``N`` consecutive small attention
+                    # blocks.
+                    num_state_slots = num_blocks // kv_cache_spec.large_block_factor
+                    state_page_bytes = kv_cache_spec.state_page_size_bytes
                     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                         dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
-                        )
-                        target_shape = (num_blocks, *shape)
+                        num_element_per_page = state_page_bytes // dtype_size
+                        target_shape = (num_state_slots, *shape)
                         stride = torch.empty(target_shape).stride()
                         target_stride = (num_element_per_page, *stride[1:])
                         assert storage_offset_bytes % dtype_size == 0
@@ -7572,6 +7584,16 @@ class GPUModelRunner(
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        # Uniform PER-LAYER page size for worker-side CoW copies, resolved
+        # from leaf specs (a UniformType group's page_size_bytes is a SUM
+        # over members and must not address per-layer tensors); None means
+        # heterogeneous per-layer pages — refuse copies loudly below.
+        # Attention-free models have no KV groups (and no copies): 0.
+        self._cow_uniform_page_size = (
+            resolve_uniform_cow_page_size(kv_cache_config.kv_cache_groups)
+            if kv_cache_config.kv_cache_groups
+            else 0
+        )
         self._mamba_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)

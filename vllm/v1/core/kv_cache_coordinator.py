@@ -87,12 +87,23 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
 
+        # Pick up the hierarchical large-block factor from any mamba group
+        # in the config. For pure-attention models this stays 1 and the
+        # BlockPool runs in flat / legacy mode.
+        large_block_factor = 1
+        for kv_cache_group in kv_cache_config.kv_cache_groups:
+            spec = kv_cache_group.kv_cache_spec
+            if isinstance(spec, MambaSpec) and spec.large_block_factor > 1:
+                large_block_factor = spec.large_block_factor
+                break
+
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            large_block_factor=large_block_factor,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -118,6 +129,27 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+
+        # Admission sums per-manager small-unit counts against the pool's
+        # global free ledger, but each small-granularity group opens its OWN
+        # large-block metas at dispense time (one group cannot reach the
+        # residual capacity of another group's partial meta). With two or
+        # more small-granularity managers the sum can pass admission while
+        # dispensing raises — a probabilistic crash near pool exhaustion.
+        # No in-tree hybrid hits this today (mamba hybrids have exactly one
+        # attention-family group); refuse loudly so a future
+        # SWA+full-attention+mamba hybrid fails at init, not mid-serve.
+        if self.block_pool.large_block_factor > 1:
+            num_small_granularity_managers = sum(
+                not manager.is_large_block for manager in self.single_type_managers
+            )
+            if num_small_granularity_managers > 1:
+                raise NotImplementedError(
+                    "Hierarchical mamba pools support at most ONE "
+                    "small-granularity (attention-family) KV cache group; "
+                    f"got {num_small_granularity_managers}. Per-group meta "
+                    "fragmentation is not yet accounted for in admission."
+                )
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.

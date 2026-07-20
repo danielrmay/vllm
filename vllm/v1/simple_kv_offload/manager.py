@@ -478,6 +478,15 @@ class SimpleCPUOffloadScheduler:
         if gpu_pool is None or self._target_free <= 0:
             return [], [], []
 
+        if gpu_pool.large_block_factor > 1:
+            # The lazy cursor walks the flat free queue, which is empty under
+            # a hierarchical pool - silently returning nothing would look
+            # like "no candidates" forever. Log once and bail explicitly.
+            logger.warning_once(
+                "Simple KV offload is unsupported with a hierarchical "
+                "(large-block) pool; lazy offload disabled."
+            )
+            return [], [], []
         free_queue = gpu_pool.free_block_queue
         cpu_pool = self.cpu_block_pool
         num_cpu_free = cpu_pool.get_num_free_blocks()

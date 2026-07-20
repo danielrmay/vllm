@@ -33,6 +33,19 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
 
+def _last_non_null_block_id(blocks: Sequence[KVCacheBlock]) -> int | None:
+    """Return the id of the last non-null block in ``blocks``, or None.
+
+    Used as the ``last_hit_block_id`` hint to ``BlockPool.get_new_blocks`` so
+    the hierarchical allocator can try to continue inside the parent large
+    block of the most recent real allocation/cache-hit.
+    """
+    for blk in reversed(blocks):
+        if not blk.is_null:
+            return blk.block_id
+    return None
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -40,6 +53,16 @@ class SingleTypeKVCacheManager(ABC):
     """
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+
+    # Whether this manager allocates large blocks (mamba) or small blocks
+    # (attention) from the hierarchical block pool. Ignored by flat pools.
+    _is_large_block: bool = False
+
+    @property
+    def is_large_block(self) -> bool:
+        """Whether this manager allocates LARGE blocks from a hierarchical
+        pool (mamba state slots) rather than small allocation blocks."""
+        return self._is_large_block
 
     def __init__(
         self,
@@ -120,6 +143,84 @@ class SingleTypeKVCacheManager(ABC):
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
         return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
 
+    def _continuation_residual_credit(self, request_id: str) -> int:
+        """Admission credit for HIT-FREE growth (decode / chunked-prefill
+        continuation): small blocks the request can reach by continuing
+        inside its own partial tail meta. That capacity is deliberately
+        outside the free ledger — without the credit, a request that OWNS
+        usable slots is refused at free_large == 0: needless preemption,
+        and a livelock when nothing else can be preempted.
+
+        Safe only for hit-free admissions: with no computed hits there is
+        no touch between admission and allocation, so the cursor (and thus
+        the residual) cannot move; ``allocate_new_blocks`` uses the same
+        ``_last_non_null_block_id`` hint and the allocator's entry check
+        subtracts the same quantity — admission and allocation MUST agree
+        or admission could admit what dispensing cannot serve. Callers on
+        hit-carrying paths must not use this.
+
+        Large-block (mamba) managers get no credit: their ids are LARGE
+        ids, which ``continuation_residual``'s small-id arithmetic would
+        misinterpret (and whole-meta allocation has no residual anyway).
+        """
+        if self._is_large_block:
+            return 0
+        # .get(): this is an ACCOUNTING call — indexing the defaultdict
+        # would create an empty entry as a side effect.
+        req_blocks = self.req_to_blocks.get(request_id)
+        if not req_blocks:
+            return 0
+        return self.block_pool.continuation_residual(
+            _last_non_null_block_id(req_blocks)
+        )
+
+    def _get_touch_ledger_cost(self, blocks: Sequence[KVCacheBlock]) -> int:
+        """Small-unit free-ledger cost of touching these evictable blocks.
+
+        Admission compares against ``BlockPool.get_num_free_blocks()`` (small
+        units), so evictable computed hits must be counted by how much a
+        ``touch`` moves that ledger, not by block count:
+
+        - Flat pool: an evictable block leaves the free queue when touched
+          -> cost 1 each (the legacy accounting).
+        - Hierarchical pool: touching a LARGE block, or the FIRST small
+          block of a RECYCLED meta, pulls a whole large block — ``factor``
+          small units — out of the free-large queue. Further hits in the
+          same meta, and hits inside partial (still-hosting) metas, do not
+          move the ledger at all. Counting them as 1 each (the flat rule)
+          under-counts by up to factor-1 per recycled meta and lets the
+          scheduler admit requests ``get_new_blocks`` cannot serve.
+
+        Hits in the same meta from ANOTHER group's accounting may be counted
+        again by that group (managers compute independently); that
+        over-counts, which is the safe direction for admission.
+        """
+        pool = self.block_pool
+        factor = pool.large_block_factor
+        if factor == 1:
+            return self._get_num_evictable_blocks(blocks)
+        cost = 0
+        counted_metas: set[int] = set()
+        for blk in blocks:
+            if blk.ref_cnt != 0 or blk.is_null:
+                continue
+            if pool._large_meta_of(blk) is not None:
+                # Large-block re-touch reclaims the whole meta.
+                cost += factor
+                continue
+            meta = pool.large_block_metas[blk.block_id // factor]
+            # Mirror of BlockPool.touch: only a RECYCLED meta (sitting in
+            # the free-large queue) is pulled out; the first touched small
+            # does it, subsequent hits in the same meta are free.
+            if (
+                meta.num_small_in_use == 0
+                and meta.next_small_idx == 0
+                and id(meta) not in counted_metas
+            ):
+                counted_metas.add(id(meta))
+                cost += factor
+        return cost
+
     def _has_partial_local_hit(
         self,
         new_computed_blocks: Sequence[KVCacheBlock],
@@ -188,7 +289,17 @@ class SingleTypeKVCacheManager(ABC):
             # NOTE: With speculative decoding, request's blocks may be allocated
             # for draft tokens which are later rejected. In this case,
             # num_required_blocks may be smaller than num_req_blocks.
-            return max(num_required_blocks - num_req_blocks, 0)
+            # Hit-free growth: credit the request's own tail-meta residual
+            # here too — with prefix caching on, EVERY running request takes
+            # this path, so omitting the credit would leave the
+            # needless-preemption case it exists to prevent in exactly the
+            # align-mode configurations that use it.
+            return max(
+                num_required_blocks
+                - num_req_blocks
+                - self._continuation_residual_credit(request_id),
+                0,
+            )
 
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks
@@ -208,10 +319,15 @@ class SingleTypeKVCacheManager(ABC):
         # `req_to_blocks`, so only skip the remainder from `new_computed_blocks`.
         num_skipped_new_computed_blocks = max(0, num_skipped_blocks - num_req_blocks)
 
+        if not new_computed_blocks:
+            num_new_blocks = max(
+                0, num_new_blocks - self._continuation_residual_credit(request_id)
+            )
         # If a computed block is an eviction candidate (in the free queue and
-        # ref_cnt == 0), it will be removed from the free queue when touched by
-        # the allocated request, so we must count it in the free-capacity check.
-        num_evictable_blocks = self._get_num_evictable_blocks(
+        # ref_cnt == 0), touching it moves the free-capacity ledger, so we
+        # must count that movement in the free-capacity check (in small
+        # units — a recycled hierarchical meta costs a whole large block).
+        num_evictable_blocks = self._get_touch_ledger_cost(
             new_computed_blocks[num_skipped_new_computed_blocks:]
         )
         if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):
@@ -311,8 +427,11 @@ class SingleTypeKVCacheManager(ABC):
             return
 
         req_blocks = self.req_to_blocks[request_id]
+        last_hit_id = _last_non_null_block_id(req_blocks)
         allocated_blocks = self.block_pool.get_new_blocks(
-            cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+            cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks),
+            large_block=self._is_large_block,
+            last_hit_block_id=last_hit_id,
         )
         req_blocks.extend(allocated_blocks)
         if self._record_new_block_ids:
@@ -342,9 +461,27 @@ class SingleTypeKVCacheManager(ABC):
             # correct; the extra block was reserved by
             # get_num_blocks_to_allocate.
             block_idx, source_block = self._partial_hit_reqs.pop(request_id)
-            cow_block = self.block_pool.get_new_blocks(1)[0]
+            # A large-block manager (mamba on a hierarchical pool) must draw
+            # its CoW block from the large-block queue: the slot has to hold
+            # one full state.
+            # The CoW draw carries no continuation hint, so it always opens a
+            # fresh meta (ledger cost N) while admission counted it as 1. That
+            # under-count is SAFE only because of two properties: (a) the free
+            # ledger is quantized to N, so any passing admission implies a whole
+            # free meta exists for this draw; and (b) after ``_apply_cow`` the
+            # CoW block is the request's tail, so the SAME call's main draw uses
+            # it as its continuation hint and recovers the fresh meta's N-1
+            # residual — exactly compensating. Reordering the draws, or making
+            # the CoW block not the tail, silently breaks admission soundness.
+            cow_block = self.block_pool.get_new_blocks(
+                1, large_block=self._is_large_block
+            )[0]
             self._apply_cow(request_id, block_idx, source_block, cow_block)
-            self.new_block_ids.append(cow_block.block_id)
+            if self._record_new_block_ids:
+                # Only attention-family ids may enter the worker zeroing
+                # list: it is small-page-indexed, and a large id leaked here
+                # would zero an unrelated small block.
+                self.new_block_ids.append(cow_block.block_id)
             cow_blocks.append(cow_block)
 
         req_blocks = self.req_to_blocks[request_id]
@@ -353,7 +490,12 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return cow_blocks
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            last_hit_id = _last_non_null_block_id(req_blocks)
+            new_blocks = self.block_pool.get_new_blocks(
+                num_new_blocks,
+                large_block=self._is_large_block,
+                last_hit_block_id=last_hit_id,
+            )
             req_blocks.extend(new_blocks)
             if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
@@ -1227,6 +1369,11 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
 class MambaManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
 
+    # Mamba allocates from the large-block free queue when the block pool is
+    # hierarchical (large_block_factor > 1). For flat pools this attribute is
+    # ignored.
+    _is_large_block: bool = True
+
     def __init__(
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
     ) -> None:
@@ -1444,14 +1591,30 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_tokens += (
                     self.kv_cache_spec.block_size * self.num_speculative_blocks
                 )
-            return super().get_num_blocks_to_allocate(
-                request_id,
-                num_tokens,
-                new_computed_blocks,
-                total_computed_tokens,
-                num_local_computed_tokens,
-                num_tokens_main_model,
-                apply_admission_cap=apply_admission_cap,
+            # Mamba blocks are LARGE blocks in a hierarchical pool, but the
+            # coordinator sums per-manager counts against the pool's
+            # SMALL-unit free count. Scale to small units so admission
+            # cannot over-schedule (which would raise in get_new_blocks).
+            # Scaling the whole sum is only sound while there are no cached
+            # hits here (a touch cost must NOT be scaled): non-align modes
+            # with factor > 1 (mamba "none") never run with prefix caching.
+            if self.block_pool.large_block_factor > 1 and new_computed_blocks:
+                raise AssertionError(
+                    "non-align mamba admission got cached hits on a "
+                    "hierarchical pool; the x-factor scaling below would "
+                    "mis-count their touch cost"
+                )
+            return (
+                super().get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    new_computed_blocks,
+                    total_computed_tokens,
+                    num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                )
+                * self.block_pool.large_block_factor
             )
         else:
             # We don't allocate blocks for lookahead tokens in align mode, because if
@@ -1492,10 +1655,13 @@ class MambaManager(SingleTypeKVCacheManager):
                         1 + self.num_speculative_blocks + int(has_partial_hit)
                     )
 
-            num_evictable_computed_blocks = self._get_num_evictable_blocks(
-                new_computed_blocks
+            # New mamba blocks are LARGE blocks: scale to the pool's small
+            # units. The evictable-touch cost is computed directly in small
+            # units (a large-block re-touch costs a whole meta).
+            return (
+                num_new_blocks * self.block_pool.large_block_factor
+                + self._get_touch_ledger_cost(new_computed_blocks)
             )
-            return num_new_blocks + num_evictable_computed_blocks
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -1574,7 +1740,20 @@ class MambaManager(SingleTypeKVCacheManager):
                     assert num_new_blocks <= self.num_speculative_blocks + 1 + int(
                         has_partial_hit
                     )
-                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                # In hierarchical mode every mamba allocation (including the
+                # partial-hit COW block below) is a LARGE block: each slot
+                # holds one full state. ``last_hit_block_id`` is a small-block
+                # continuation hint and is meaningless for large blocks.
+                last_hit_id = (
+                    None
+                    if self._is_large_block
+                    else _last_non_null_block_id(req_blocks)
+                )
+                new_blocks = self.block_pool.get_new_blocks(
+                    num_new_blocks,
+                    large_block=self._is_large_block,
+                    last_hit_block_id=last_hit_id,
+                )
                 returned_blocks = req_blocks[prev_block_len:]
                 if partial_hit is not None:
                     block_idx, source_block = partial_hit
@@ -1769,6 +1948,14 @@ class SinkFullAttentionManager(FullAttentionManager):
         )
         sink_len = kv_cache_spec.sink_len
         assert sink_len is not None and sink_len > 0 and sink_len % self.block_size == 0
+        # raise, not assert: must survive python -O (otherwise this
+        # degrades to an obscure popleft on an empty flat queue).
+        if self.block_pool.large_block_factor != 1:
+            raise NotImplementedError(
+                "Sink attention allocates from the flat free queue, which "
+                "is empty under a hierarchical (large-block) pool; this "
+                "combination is unsupported."
+            )
         num_sink_block = sink_len // self.block_size
         self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
 

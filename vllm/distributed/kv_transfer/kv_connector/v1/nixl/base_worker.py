@@ -1115,7 +1115,12 @@ class NixlBaseConnectorWorker:
             # `layer_spec.page_size_bytes` only accounts for logical page_size, that is
             # the page_size assuming constant `self._logical_num_blocks`.
             physical_page_size = (
-                layer_spec.page_size_bytes
+                # One full state per logical mamba block: under a
+                # hierarchical pool ``page_size_bytes`` becomes the
+                # per-small-block SHARE of a state, so the transfer unit
+                # must use the explicit state page (identical when
+                # large_block_factor == 1).
+                layer_spec.state_page_size_bytes
                 if isinstance(layer_spec, MambaSpec)
                 else layer_spec.page_size_bytes
                 // self._physical_blocks_per_logical_kv_block
