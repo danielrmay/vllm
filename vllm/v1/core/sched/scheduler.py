@@ -321,6 +321,13 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        # With a hierarchical mamba pool, the offloading connector stores
+        # mamba states at STATE cadence (block_size * large_block_factor).
+        # States only materialize at chunk ends, so offloadable states exist
+        # only if chunk ends land on state-cadence boundaries - the same
+        # invariant flat mode gets implicitly (there, block_size IS the state
+        # span). Coarsen the split alignment only when offloading is active;
+        # plain align keeps fine-grained (block_size) chunk ends.
         kv_transfer_config = vllm_config.kv_transfer_config
         # The per-group MAX hit shortcut below (waiting-queue scheduling) is
         # only sound when the connector transfers the mamba state for the
@@ -353,8 +360,8 @@ class Scheduler(SchedulerInterface):
         }
         # Today the factor is stamped from a single cache_config value, so
         # all mamba groups agree by construction. The scheduler tracks ONE
-        # hierarchy factor (admission scaling and the connector guards
-        # assume it), so fail loudly if that ever changes.
+        # hierarchy factor (admission scaling and the state-aligned split
+        # below assume it), so fail loudly if that ever changes.
         if len(mamba_factors) > 1:
             # Config-shape validation must survive python -O (asserts do not).
             raise ValueError(
@@ -363,22 +370,30 @@ class Scheduler(SchedulerInterface):
                 f"single hierarchy factor."
             )
         self.mamba_large_block_factor = mamba_factors.pop() if mamba_factors else 1
-        if self.mamba_large_block_factor > 1 and loadable:
-            # No KV transfer connector supports the hierarchical pool's
-            # mamba geometry yet: the offloading connector cannot store
-            # states (they only materialize at chunk ends it has no say
-            # over), and P/D connectors' region registration and block-id
-            # mapping still assume the flat small-block layout (e.g. NIXL
-            # sizes the mamba region by the small-block count in
-            # nixl/base_worker.py). Refuse loudly rather than corrupt or
-            # crash at transfer time; flat (factor == 1) and "all" modes
+        non_offload_connectors = [n for n in loadable if n != "OffloadingConnector"]
+        if self.mamba_large_block_factor > 1 and non_offload_connectors:
+            # This PR lifts the base branch's refusal ONLY for the
+            # offloading connector (state-cadence storing lands here). P/D
+            # connectors' region registration and block-id mapping still
+            # assume the flat small-block layout (e.g. NIXL sizes the mamba
+            # region by the small-block count in nixl/base_worker.py), so
+            # they keep refusing loudly; flat (factor == 1) and "all" modes
             # are unaffected.
             raise NotImplementedError(
-                "KV transfer connectors are not yet supported with a "
-                "hierarchical mamba pool (large_block_factor > 1); "
-                f"configured: {loadable}. Serve without KV "
-                "connectors or use --mamba-cache-mode all."
+                "KV transfer connectors other than OffloadingConnector are "
+                "not yet supported with a hierarchical mamba pool "
+                f"(large_block_factor > 1); configured: "
+                f"{non_offload_connectors}. Serve without them or use "
+                "--mamba-cache-mode all."
             )
+        # Steer chunk ends onto the span cadence only when something can
+        # consume the states there (the offloading connector); otherwise
+        # keep the fine grid.
+        self.mamba_split_state_aligned = (
+            self.need_mamba_block_aligned_split
+            and self.mamba_large_block_factor > 1
+            and "OffloadingConnector" in connector_names
+        )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.
@@ -449,6 +464,16 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
+        # Mid-chunk step cadence. With offloading on a hierarchical pool,
+        # steer intermediate chunk ends onto STATE-cadence boundaries so the
+        # states they materialize are offloadable (see __init__). The LAST
+        # cacheable boundary below stays on the fine grid regardless: the
+        # align manager caches step-end states at fine block boundaries, and
+        # coarsening it would let the tail chunk run to an unaligned end
+        # whose state cannot be cached (breaking native resume parity).
+        split_block_size = block_size
+        if self.mamba_split_state_aligned:
+            split_block_size *= self.mamba_large_block_factor
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
@@ -459,11 +484,16 @@ class Scheduler(SchedulerInterface):
         end = start + num_new_tokens
         # Until `last_cache_position`, chunk ends must land on block
         # boundaries. May yield an empty chunk (budget cannot reach the next
-        # boundary); the caller then skips the request.
+        # boundary); the caller then skips the request. When the coarse step
+        # cadence cannot make progress within the budget, degrade to the
+        # fine grid (the state is then not offloadable, but stays correct).
         if end < last_cache_position:
-            end = end // block_size * block_size
+            clipped = end // split_block_size * split_block_size
+            if clipped <= start:
+                clipped = end // block_size * block_size
+            end = clipped
 
-        next_block_boundary = (start // block_size + 1) * block_size
+        next_block_boundary = (start // split_block_size + 1) * split_block_size
         tail_boundary = (
             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
             if self.mamba_partial_cache_hit
@@ -474,10 +504,18 @@ class Scheduler(SchedulerInterface):
             # the block grid before running on, so the crossed boundary's
             # state is materialized (unless it is past the cacheable range).
             next_block_boundary
-            if start % block_size != 0 and next_block_boundary <= last_cache_position
+            if start % split_block_size != 0
+            and next_block_boundary <= last_cache_position
             else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
+            # State-aligned splitting: a chunk heading into the fine tail
+            # must stop at the LAST coarse (state-span) boundary first, or
+            # that offloadable state never materializes and the CPU tier's
+            # trail ends one span short.
+            (last_cache_position // split_block_size * split_block_size)
+            if self.mamba_split_state_aligned
+            else 0,
             # Fine-grained hits: the prompt's partial-tail entry can only be
             # registered by a chunk ending exactly at its last hash boundary.
             tail_boundary

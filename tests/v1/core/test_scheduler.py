@@ -5428,9 +5428,14 @@ def test_hierarchical_pool_refuses_kv_connectors():
         kv_role="kv_both",
         kv_connector_extra_config={"cpu_bytes_to_use": 1 << 30},
     )
-    for connector in ("NixlConnector", offload_cfg):
-        with pytest.raises(NotImplementedError, match="hierarchical mamba pool"):
-            create_scheduler(use_kv_connector=connector, kv_cache_spec=mamba_spec(4))
+    # P/D connectors (flat-layout region registration) still refuse...
+    with pytest.raises(NotImplementedError, match="hierarchical mamba pool"):
+        create_scheduler(use_kv_connector="NixlConnector", kv_cache_spec=mamba_spec(4))
+    # ...but this PR lifts the refusal for the offloading connector.
+    scheduler = create_scheduler(
+        use_kv_connector=offload_cfg, kv_cache_spec=mamba_spec(4)
+    )
+    assert scheduler.mamba_large_block_factor == 4
 
     scheduler = create_scheduler(
         use_kv_connector=offload_cfg, kv_cache_spec=mamba_spec(1)

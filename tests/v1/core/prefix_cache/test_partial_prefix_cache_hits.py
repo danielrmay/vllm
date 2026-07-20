@@ -43,6 +43,7 @@ def test_mamba_align_split_partial_tail_schedule():
         use_eagle=False,
         hash_block_size=hash_block_size,
         mamba_partial_cache_hit=True,
+        mamba_split_state_aligned=False,
     )
     split = Scheduler._mamba_block_aligned_split
 

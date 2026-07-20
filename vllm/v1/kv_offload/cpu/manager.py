@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from typing import Literal
 
 from typing_extensions import override
@@ -19,6 +19,7 @@ from vllm.v1.kv_offload.base import (
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
+    get_offload_group_idx,
 )
 from vllm.v1.kv_offload.cpu.common import (
     CPULoadStoreSpec,
@@ -330,5 +331,172 @@ class CPUOffloadingManager(OffloadingManager):
                 self.stores_skipped_in_current_batch,
             )
             self.stores_skipped_in_current_batch = 0
+
+        return stats
+
+
+class GroupRoutedCPUOffloadingManager(OffloadingManager):
+    """Routes offloading operations to per-KV-group CPUOffloadingManagers.
+
+    Used when KV cache groups have heterogeneous per-block byte costs
+    (e.g. hierarchical mamba state blocks vs attention blocks). Each group
+    gets its own CPU block pool and eviction policy, so churn in one group
+    cannot evict the other's entries, and block ids are group-local,
+    matching the per-group-sized CPU tensors on the worker side.
+
+    Multi-key operations partition their keys by the group index embedded
+    in each OffloadKey. Key order within each group is preserved, and the
+    connector emits keys grouped in group-index order, so concatenating
+    per-group spec block ids reproduces the input key order.
+    """
+
+    def __init__(self, managers: "Sequence[CPUOffloadingManager]"):
+        assert len(managers) > 0
+        self.medium: str = MEDIUM_CPU
+        # Indexed by group; same-cost-class groups share a manager instance.
+        self._managers = tuple(managers)
+        # Distinct instances, for aggregate operations (stats/reset/events).
+        self._unique_managers = tuple(dict.fromkeys(managers))
+
+    def _manager_of(self, key: OffloadKey) -> CPUOffloadingManager:
+        return self._managers[get_offload_group_idx(key)]
+
+    @staticmethod
+    def _group_runs(
+        keys: Iterable[OffloadKey],
+    ) -> list[tuple[int, list[OffloadKey]]]:
+        """Split keys into contiguous same-group runs, preserving order."""
+        runs: list[tuple[int, list[OffloadKey]]] = []
+        for key in keys:
+            group_idx = get_offload_group_idx(key)
+            if runs and runs[-1][0] == group_idx:
+                runs[-1][1].append(key)
+            else:
+                runs.append((group_idx, [key]))
+        return runs
+
+    @override
+    def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        return RequestOffloadingContext()
+
+    @override
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        return self._manager_of(key).lookup(key, req_context)
+
+    @override
+    def prepare_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> CPULoadStoreSpec:
+        block_ids: list[int] = []
+        for group_idx, run in self._group_runs(keys):
+            spec = self._managers[group_idx].prepare_load(run, req_context)
+            block_ids.extend(spec.block_ids.tolist())
+        return CPULoadStoreSpec(block_ids)
+
+    @override
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        for group_idx, run in self._group_runs(keys):
+            self._managers[group_idx].touch(run, req_context)
+
+    @override
+    def complete_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        for group_idx, run in self._group_runs(keys):
+            self._managers[group_idx].complete_load(run, req_context)
+
+    @override
+    def prepare_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> PrepareStoreOutput | None:
+        prepared: list[tuple[int, PrepareStoreOutput]] = []
+        for group_idx, run in self._group_runs(keys):
+            output = self._managers[group_idx].prepare_store(run, req_context)
+            if output is None:
+                # Roll back groups already prepared in this call so no block
+                # is left pending a store that will never be submitted.
+                # Entries a successful earlier prepare_store already EVICTED
+                # cannot be restored — that is bounded cache loss (the store
+                # never happens), not corruption.
+                for done_idx, done_output in prepared:
+                    if done_output.keys_to_store:
+                        self._managers[done_idx].complete_store(
+                            done_output.keys_to_store, req_context, success=False
+                        )
+                return None
+            prepared.append((group_idx, output))
+
+        keys_to_store: list[OffloadKey] = []
+        block_ids: list[int] = []
+        evicted_keys: list[OffloadKey] = []
+        for _, output in prepared:
+            keys_to_store.extend(output.keys_to_store)
+            block_ids.extend(output.store_spec.block_ids.tolist())
+            evicted_keys.extend(output.evicted_keys)
+        return PrepareStoreOutput(
+            keys_to_store=keys_to_store,
+            store_spec=CPULoadStoreSpec(block_ids),
+            evicted_keys=evicted_keys,
+        )
+
+    @override
+    def complete_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        success: bool = True,
+    ) -> None:
+        for group_idx, run in self._group_runs(keys):
+            self._managers[group_idx].complete_store(run, req_context, success)
+
+    @override
+    def reset_cache(self) -> None:
+        for manager in self._unique_managers:
+            manager.reset_cache()
+
+    @override
+    def take_events(self) -> Iterable[OffloadingEvent]:
+        for manager in self._unique_managers:
+            yield from manager.take_events()
+
+    @override
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        # Capacity-weighted aggregation over the sub-pools, mirroring the
+        # single-pool math in CPUOffloadingManager.get_stats.
+        stats = OffloadingConnectorStats()
+        total_blocks = sum(m._num_blocks for m in self._unique_managers)
+        num_used = sum(
+            m._num_allocated_blocks - len(m._free_list) - m._num_evictable_cache_blocks
+            for m in self._unique_managers
+        )
+        usage = num_used / total_blocks if total_blocks > 0 else 0.0
+        stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC, usage)
+
+        for manager in self._unique_managers:
+            for allocation_size in manager.allocation_sizes_in_current_batch:
+                stats.observe_histogram(
+                    CPUOffloadingMetrics.CPU_ALLOCATION_SIZE, allocation_size
+                )
+            manager.allocation_sizes_in_current_batch.clear()
+
+        write_pending = sum(m._num_write_pending_blocks for m in self._unique_managers)
+        write_usage = write_pending / total_blocks if total_blocks > 0 else 0.0
+        read_usage = max(usage - write_usage, 0.0)
+        stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC, write_usage)
+        stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_READ_USAGE_PERC, read_usage)
+
+        # Match the single-pool emission cadence: increment (0 included)
+        # whenever the metric is registered, i.e. a store threshold >= 2.
+        if any(m.store_threshold >= 2 for m in self._unique_managers):
+            stores_skipped = 0
+            for manager in self._unique_managers:
+                if manager.store_threshold >= 2:
+                    stores_skipped += manager.stores_skipped_in_current_batch
+                    manager.stores_skipped_in_current_batch = 0
+            stats.increase_counter(CPUOffloadingMetrics.STORES_SKIPPED, stores_skipped)
 
         return stats

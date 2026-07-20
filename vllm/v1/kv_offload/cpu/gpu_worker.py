@@ -3,9 +3,11 @@
 import functools
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
+import psutil
 import torch
 
 from vllm import _custom_ops as ops
@@ -473,17 +475,62 @@ class CPUOffloadingWorker(OffloadingWorker):
         self,
         kv_caches: CanonicalKVCaches,
         blocks_per_chunk: int,
-        num_cpu_blocks: int,
+        num_cpu_blocks: "int | Sequence[int]",
         mmap_region: SharedOffloadRegion | None = None,
+        max_pin_fraction: float = 0.5,
     ):
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
+
+        # Resolve the CPU row count for each canonical tensor. With per-group
+        # pools (num_cpu_blocks given per group), block ids are group-local
+        # and each tensor is sized by ITS group's pool. Each canonical tensor
+        # must belong to exactly one group for the ids to be unambiguous.
+        if isinstance(num_cpu_blocks, int):
+            rows_per_tensor = [num_cpu_blocks] * len(kv_caches.tensors)
+        else:
+            tensor_rows: dict[int, int] = {}
+            for group_idx, refs in enumerate(kv_caches.group_data_refs):
+                for ref in refs:
+                    rows = num_cpu_blocks[group_idx]
+                    prev = tensor_rows.setdefault(ref.tensor_idx, rows)
+                    assert prev == rows, (
+                        "Groups sharing a canonical tensor must share a CPU "
+                        f"pool (same row count); tensor {ref.tensor_idx} got "
+                        f"{prev} and {rows}."
+                    )
+            rows_per_tensor = [
+                tensor_rows[t_idx] for t_idx in range(len(kv_caches.tensors))
+            ]
+
+        # Hard guard: pinned memory is unswappable, and a sizing bug here can
+        # take down the HOST (the per-tensor loop below multiplies
+        # num_cpu_blocks by every tensor's page size). Refuse plans that
+        # exceed available memory instead of dying mid-allocation.
+        planned_bytes = blocks_per_chunk * sum(
+            rows * t.page_size_bytes
+            for rows, t in zip(rows_per_tensor, kv_caches.tensors)
+        )
+        available_bytes = psutil.virtual_memory().available
+        if pin_memory and planned_bytes > available_bytes * max_pin_fraction:
+            raise ValueError(
+                f"CPU offload region would pin {planned_bytes / 1e9:.1f} GB "
+                f"(rows={rows_per_tensor[:4]}... x "
+                f"{len(kv_caches.tensors)} tensors), exceeding "
+                f"{max_pin_fraction:.4g} x available host memory "
+                f"({available_bytes / 1e9:.1f} GB). This usually means the "
+                "per-block byte accounting does not match the canonical "
+                "tensor layout (e.g. mixed per-group block cadences). "
+                "Deliberate large-pin deployments can raise the threshold "
+                'via kv_connector_extra_config["max_pin_fraction"].'
+            )
+
         if mmap_region is not None and pin_memory:
             pin_mmap_region(mmap_region)
 
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
-        for kv_cache_tensor in kv_caches.tensors:
+        for num_tensor_rows, kv_cache_tensor in zip(rows_per_tensor, kv_caches.tensors):
             gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
             gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
                 (-1, gpu_page_size_bytes)
@@ -495,16 +542,16 @@ class CPUOffloadingWorker(OffloadingWorker):
             else:
                 t0 = time.monotonic()
                 cpu_tensor = torch.zeros(
-                    (num_cpu_blocks, cpu_page_size_bytes),
+                    (num_tensor_rows, cpu_page_size_bytes),
                     dtype=torch.int8,
                     device="cpu",
                     pin_memory=pin_memory,
                 )
                 logger.debug(
                     "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
-                    num_cpu_blocks,
+                    num_tensor_rows,
                     cpu_page_size_bytes,
-                    num_cpu_blocks * cpu_page_size_bytes / 1e9,
+                    num_tensor_rows * cpu_page_size_bytes / 1e9,
                     time.monotonic() - t0,
                 )
 

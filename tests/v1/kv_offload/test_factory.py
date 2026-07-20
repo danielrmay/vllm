@@ -615,8 +615,10 @@ def test_build_metric_definitions_returns_counter_at_threshold():
 
 
 def test_offloading_spec_accepts_blocks_per_chunk_for_heterogeneous_groups():
+    # Budget must afford >= one chunk PER cost class (the zero-capacity
+    # guard raises otherwise), so size it generously.
     config = _make_layout_vllm_config(
-        cpu_bytes_to_use=65536,
+        cpu_bytes_to_use=1 << 22,
         extra_config={"blocks_per_chunk": 2},
     )
 

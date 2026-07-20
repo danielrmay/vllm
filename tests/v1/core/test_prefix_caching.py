@@ -1081,6 +1081,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         use_eagle=False,
         hash_block_size=block_size,
         mamba_partial_cache_hit=False,
+        mamba_split_state_aligned=False,
     )
     req_2.shared_prefix_boundary = shared_prefix_boundary
     num_new_tokens_adjusted = Scheduler._mamba_block_aligned_split(

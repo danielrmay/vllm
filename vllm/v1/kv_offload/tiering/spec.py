@@ -134,6 +134,18 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
+        if self.num_blocks_per_group is not None:
+            # The parent's per-cost-class sizing leaves the uniform-pool
+            # fields (kv_bytes_per_chunk, cpu_page_size_per_worker) unset,
+            # and the tiering regions/manager are built on the uniform
+            # layout; composing tiering with per-class pools needs its own
+            # region plumbing. Refuse loudly rather than build a zero-byte
+            # region.
+            raise NotImplementedError(
+                "TieringOffloadingSpec does not yet support KV cache groups "
+                "with heterogeneous per-block byte costs (e.g. hybrid "
+                "models); use the plain CPU offloading spec instead."
+            )
         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
         self._manager: OffloadingManager | None = None
         if self.kv_events_config.self_describing_kv_events:
