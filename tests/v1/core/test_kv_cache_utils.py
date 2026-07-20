@@ -2731,3 +2731,36 @@ def test_resolve_block_hashes_rejects_mismatched_view():
     mismatched = BlockHashListWithBlockSize(raw, 2, 8)
     with pytest.raises(AssertionError):
         resolve_block_hashes(mismatched, 2, 4)
+
+
+def test_unify_kv_cache_spec_page_size_hierarchical_mamba():
+    """Hierarchical variant of the #43626 regression: ``page_size_padded``
+    is the FULL state page, but unification targets ALLOCATION pages
+    (state_page // large_block_factor), so the padding target must be
+    scaled by the factor. Assigning max_page_size directly would under-pad
+    the state page by the factor."""
+    factor = 4
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((2, 512), (3, 32, 32)),
+        dtypes=(torch.float32, torch.float32),
+        mamba_cache_mode="align",
+        large_block_factor=factor,
+        # State page must divide evenly into factor allocation shares.
+        page_size_padded=16384,
+    )
+    # Allocation page is the per-small-block share of the state page.
+    assert mamba_spec.page_size_bytes == mamba_spec.state_page_size_bytes // factor
+    assert mamba_spec.page_size_bytes == 4096
+    draft_attn_spec = new_kv_cache_spec(num_kv_heads=4)  # larger page
+    max_page = draft_attn_spec.page_size_bytes
+    assert max_page > mamba_spec.page_size_bytes
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {"mamba_layer": mamba_spec, "draft_attn_layer": draft_attn_spec}
+    )
+    m = unified["mamba_layer"]
+    # Allocation page unified to the max; state page scaled by the factor.
+    assert m.page_size_bytes == max_page
+    assert m.state_page_size_bytes == max_page * factor
+    assert m.large_block_factor == factor

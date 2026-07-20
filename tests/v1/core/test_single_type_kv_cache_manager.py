@@ -536,3 +536,442 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+def _make_align_mamba_manager(large_block_factor: int = 4, block_size: int = 16):
+    """MambaManager in align mode on a hierarchical (large-block) pool."""
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,), (1,)),
+        dtypes=(torch.float32, torch.float32),
+        mamba_cache_mode="align",
+        large_block_factor=large_block_factor,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+        large_block_factor=large_block_factor,
+    )
+    manager = MambaManager(
+        spec,
+        block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+    return manager, block_pool
+
+
+def test_mamba_align_admission_counts_in_small_units():
+    """The coordinator sums per-manager block counts against the pool's
+    SMALL-unit free count, so a large-block mamba manager must report its
+    align-mode requirement scaled by large_block_factor."""
+
+    def count(factor: int) -> int:
+        manager, _ = _make_align_mamba_manager(large_block_factor=factor, block_size=16)
+        return manager.get_num_blocks_to_allocate(
+            request_id="r0",
+            num_tokens=32,
+            new_computed_blocks=[],
+            total_computed_tokens=0,
+            num_local_computed_tokens=0,
+            num_tokens_main_model=32,
+        )
+
+    # The invariant: a hierarchical manager reports exactly the flat-mode
+    # count scaled to small units.
+    flat = count(1)
+    assert flat >= 1
+    assert count(4) == flat * 4
+
+
+def test_mamba_align_state_block_is_large():
+    """Align allocates one real state block per step; on a hierarchical pool
+    that block must come from the large-block queue (a full state slot),
+    with the skipped positions padded by nulls."""
+    manager, pool = _make_align_mamba_manager(large_block_factor=4, block_size=16)
+    free_large_before = pool.get_num_free_large_blocks()
+    new_blocks = manager.allocate_new_blocks(
+        request_id="r0", num_tokens=32, num_tokens_main_model=32
+    )
+    req_blocks = manager.req_to_blocks["r0"]
+    real_blocks = [b for b in req_blocks if not b.is_null]
+    assert len(real_blocks) == 1
+    state_block = real_blocks[0]
+    # Identity check: the allocated block IS its meta's large block.
+    meta = pool.large_block_metas[state_block.block_id]
+    assert meta.large_block is state_block
+    assert pool.get_num_free_large_blocks() == free_large_before - 1
+    assert state_block in new_blocks
+
+
+def test_mamba_align_partial_hit_cow_block_is_large():
+    """A partial prefix-cache hit redirects the shared tail state to a private
+    CoW block; on a hierarchical pool the CoW destination must be a LARGE
+    block (it holds one full state), and the pending copy pair must be
+    recorded for the worker."""
+    manager, pool = _make_align_mamba_manager(large_block_factor=4, block_size=16)
+    # Seed a request that "hit" one cached state block.
+    source_block = pool.get_new_blocks(1, large_block=True)[0]
+    manager.req_to_blocks["r0"].append(source_block)
+    manager._partial_hit_reqs["r0"] = (0, source_block)
+
+    manager.allocate_new_blocks(
+        request_id="r0", num_tokens=32, num_tokens_main_model=32
+    )
+
+    req_blocks = manager.req_to_blocks["r0"]
+    # The source was displaced by the CoW copy.
+    assert source_block not in req_blocks
+    cow_block = req_blocks[0]
+    meta = pool.large_block_metas[cow_block.block_id]
+    assert meta.large_block is cow_block
+    assert (source_block, cow_block) in manager._pending_cow_copies
+    # Both endpoints stay retained until the worker-side copy has run.
+    assert source_block.ref_cnt >= 1
+    assert cow_block.ref_cnt >= 2
+
+
+def test_mamba_align_external_allocation_shape():
+    """A connector (external) hit must produce the same align block layout as
+    a local GPU hit: null padding plus a SINGLE real state block at the last
+    computed index. The base-class path allocates one real block per
+    allocation-block span instead, wasting large blocks and populating the
+    worker block table with garbage-filled state slots."""
+    manager, pool = _make_align_mamba_manager(large_block_factor=4, block_size=16)
+    free_large_before = pool.get_num_free_large_blocks()
+
+    # Connector-style resume: no local hit, 320 external (loaded) tokens.
+    manager.add_local_computed_blocks(
+        request_id="r0",
+        new_computed_blocks=[],
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=320,
+    )
+    manager.allocate_external_computed_blocks(
+        request_id="r0",
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=320,
+    )
+
+    req_blocks = manager.req_to_blocks["r0"]
+    assert len(req_blocks) == 320 // 16
+    real_blocks = [b for b in req_blocks if not b.is_null]
+    # Align semantics: exactly ONE state slot holds the loaded state, at the
+    # last computed index (the align convention consumed by the worker).
+    assert len(real_blocks) == 1, f"expected 1 real state block, got {len(real_blocks)}"
+    assert req_blocks[-1] is real_blocks[0]
+    assert pool.get_num_free_large_blocks() == free_large_before - 1
+
+
+def _make_hierarchical_attention_manager(large_block_factor: int = 4):
+    """FullAttentionManager on a hierarchical (large-block) pool."""
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    block_size = 16
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    pool = BlockPool(
+        num_gpu_blocks=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+        large_block_factor=large_block_factor,
+    )
+    manager = FullAttentionManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+        max_admission_blocks_per_request=10**9,
+    )
+    return manager, pool
+
+
+def _recycled_meta_with_cached_hits(pool, num_hits=2):
+    """Cache `num_hits` small blocks, free them so their meta recycles into
+    the free-large queue, then occupy the rest of the pool down to exactly
+    2 free large blocks. Returns the evictable hit blocks."""
+    from vllm.v1.core.kv_cache_utils import (
+        BlockHash,
+        make_block_hash_with_group_id,
+    )
+
+    n = pool.large_block_factor
+    smalls = pool.get_new_blocks(num_hits)
+    meta = pool.large_block_metas[smalls[0].block_id // n]
+    for i, blk in enumerate(smalls):
+        key = make_block_hash_with_group_id(BlockHash(f"prefix-{i}".encode()), 0)
+        blk.set_block_hash(key, num_tokens=None)
+        pool.cached_block_hash_to_block.insert(key, blk)
+    pool.free_blocks(smalls)  # meta recycled; hashes linger -> evictable hits
+
+    held = []
+    while pool.get_num_free_large_blocks() > 2:
+        blk = pool.get_new_blocks(1, large_block=True)[0]
+        if blk is meta.large_block:
+            pool.free_blocks([blk])
+            held.extend(pool.get_new_blocks(2, large_block=True))
+        else:
+            held.append(blk)
+    return smalls
+
+
+def test_hierarchical_admission_counts_touch_cost_of_recycled_meta():
+    """Regression: touching an evictable hit whose parent meta is RECYCLED
+    removes a whole large block (factor small units) from the free ledger,
+    but admission used to count it as 1 small unit — the scheduler admitted
+    requests get_new_blocks could not serve, crashing the engine with an
+    uncaught ValueError under ordinary near-full prefix-caching load."""
+    n = 4
+    manager, pool = _make_hierarchical_attention_manager(large_block_factor=n)
+    block_size = manager.block_size
+    smalls = _recycled_meta_with_cached_hits(pool, num_hits=2)
+
+    free_small = pool.get_num_free_blocks()
+    assert free_small == 2 * n  # 2 free large blocks
+
+    # 7 total blocks: 2 evictable cached hits + 5 new. The touch of the
+    # recycled meta costs n=4 small units, so the true need is 5 + 4 = 9 > 8:
+    # admission must refuse (the old per-block count said 5 + 2 = 7 <= 8).
+    need = manager.get_num_blocks_to_allocate(
+        request_id="r-refuse",
+        num_tokens=7 * block_size,
+        new_computed_blocks=smalls,
+        total_computed_tokens=2 * block_size,
+        num_local_computed_tokens=2 * block_size,
+        num_tokens_main_model=7 * block_size,
+    )
+    assert need == 5 + n
+    assert need > free_small
+
+    # 6 total blocks: 4 new + touch cost 4 = 8 <= 8: admitted, and the
+    # allocator must then actually serve it without raising.
+    need = manager.get_num_blocks_to_allocate(
+        request_id="r-admit",
+        num_tokens=6 * block_size,
+        new_computed_blocks=smalls,
+        total_computed_tokens=2 * block_size,
+        num_local_computed_tokens=2 * block_size,
+        num_tokens_main_model=6 * block_size,
+    )
+    assert need == 4 + n
+    assert need <= free_small
+    pool.touch(smalls)
+    new_blocks = pool.get_new_blocks(4, last_hit_block_id=smalls[-1].block_id)
+    assert len(new_blocks) == 4
+
+
+def test_hierarchical_admission_hits_in_partial_meta_cost_nothing():
+    """Evictable hits inside a PARTIAL meta (other smalls still in use)
+    do not move the free ledger when touched; admission must not charge
+    for them."""
+    from vllm.v1.core.kv_cache_utils import (
+        BlockHash,
+        make_block_hash_with_group_id,
+    )
+
+    n = 4
+    manager, pool = _make_hierarchical_attention_manager(large_block_factor=n)
+    block_size = manager.block_size
+
+    # 3 smalls from one meta; cache and free two, keep the third in use so
+    # the meta stays partial (never recycles).
+    smalls = pool.get_new_blocks(3)
+    for i, blk in enumerate(smalls[:2]):
+        key = make_block_hash_with_group_id(BlockHash(f"p-{i}".encode()), 0)
+        blk.set_block_hash(key, num_tokens=None)
+        pool.cached_block_hash_to_block.insert(key, blk)
+    pool.free_blocks(smalls[:2])
+
+    free_before = pool.get_num_free_blocks()
+    need = manager.get_num_blocks_to_allocate(
+        request_id="r",
+        num_tokens=3 * block_size,
+        new_computed_blocks=smalls[:2],
+        total_computed_tokens=2 * block_size,
+        num_local_computed_tokens=2 * block_size,
+        num_tokens_main_model=3 * block_size,
+    )
+    assert need == 1  # 1 new block; the partial-meta hits cost 0
+    pool.touch(smalls[:2])
+    assert pool.get_num_free_blocks() == free_before  # ledger unmoved
+
+
+def test_decode_continues_in_own_partial_meta_when_free_large_is_zero():
+    """Livelock regression: with the free-large queue EMPTY, a running
+    request whose tail meta still has residual slots must be admitted for
+    hit-free growth (decode) and served by continuation — refusing it
+    forces preemption that cannot help (re-prefill needs the same
+    capacity), a livelock in the single-request/tight-pool corner."""
+    n = 4
+    manager, pool = _make_hierarchical_attention_manager(large_block_factor=n)
+    block_size = manager.block_size
+
+    # The request owns 1 slot of a fresh meta; drain the rest of the pool.
+    first = pool.get_new_blocks(1)
+    manager.req_to_blocks["r"].extend(first)
+    held = []
+    while pool.get_num_free_large_blocks() > 0:
+        held.append(pool.get_new_blocks(1, large_block=True)[0])
+    assert pool.get_num_free_blocks() == 0
+
+    # Hit-free growth of 2 more blocks: fits the tail meta's 3 residual
+    # slots, so admission must report 0 new ledger blocks needed...
+    need = manager.get_num_blocks_to_allocate(
+        request_id="r",
+        num_tokens=3 * block_size,
+        new_computed_blocks=[],
+        total_computed_tokens=0,
+        num_local_computed_tokens=0,
+        num_tokens_main_model=3 * block_size,
+    )
+    assert need == 0
+    # ...and the allocator must serve it from the same continuation.
+    new_blocks = pool.get_new_blocks(2, last_hit_block_id=first[0].block_id)
+    assert len(new_blocks) == 2
+    assert all(b.block_id // n == first[0].block_id // n for b in new_blocks)
+
+    # Residual now 1; growth beyond it is refused again (4 > 1 usable).
+    manager.req_to_blocks["r"].extend(new_blocks)
+    need = manager.get_num_blocks_to_allocate(
+        request_id="r",
+        num_tokens=7 * block_size,
+        new_computed_blocks=[],
+        total_computed_tokens=0,
+        num_local_computed_tokens=0,
+        num_tokens_main_model=7 * block_size,
+    )
+    assert need == 4 - 1  # 4 more blocks, 1 own-residual slot usable
+
+
+def test_admission_ignores_other_requests_partial_metas():
+    """The residual subtraction must apply only to the request's OWN tail
+    meta: another request's partial meta is unreachable by this request's
+    continuation hint, so admission must not count it."""
+    n = 4
+    manager, pool = _make_hierarchical_attention_manager(large_block_factor=n)
+    block_size = manager.block_size
+
+    # Someone else holds a partial meta; this request owns nothing.
+    other = pool.get_new_blocks(1)
+    assert pool.large_block_metas[other[0].block_id // n].next_small_idx == 1
+    while pool.get_num_free_large_blocks() > 0:
+        pool.get_new_blocks(1, large_block=True)
+
+    need = manager.get_num_blocks_to_allocate(
+        request_id="newcomer",
+        num_tokens=1 * block_size,
+        new_computed_blocks=[],
+        total_computed_tokens=0,
+        num_local_computed_tokens=0,
+        num_tokens_main_model=1 * block_size,
+    )
+    assert need == 1  # no own chain -> no residual credit
+
+
+def test_fast_path_admission_also_credits_own_residual():
+    """Graveyard regression (G1): with prefix caching on, every RUNNING
+    request takes the num_cached_block admission fast path — the
+    continuation-residual credit must apply there too, or it is dead in
+    exactly the align-mode configurations it was added for."""
+    n = 4
+    manager, pool = _make_hierarchical_attention_manager(large_block_factor=n)
+    block_size = manager.block_size
+
+    first = pool.get_new_blocks(1)
+    manager.req_to_blocks["r"].extend(first)
+    # Mark the request as running-and-cached: admission takes the fast path.
+    manager.num_cached_block["r"] = 1
+    while pool.get_num_free_large_blocks() > 0:
+        pool.get_new_blocks(1, large_block=True)
+    assert pool.get_num_free_blocks() == 0
+
+    need = manager.get_num_blocks_to_allocate(
+        request_id="r",
+        num_tokens=3 * block_size,
+        new_computed_blocks=[],
+        total_computed_tokens=0,
+        num_local_computed_tokens=0,
+        num_tokens_main_model=3 * block_size,
+    )
+    assert need == 0  # 2 new blocks fit the tail meta's 3 residual slots
+    assert len(pool.get_new_blocks(2, last_hit_block_id=first[0].block_id)) == 2
+
+
+def test_attention_cow_at_exhaustion_survives_via_tail_hint():
+    """Pins the CoW compensation invariant documented at the draw site:
+    admission counts the CoW block as 1 small unit, but the un-hinted CoW
+    draw consumes a whole fresh meta (N units). Safety = (a) ledger
+    quantization guarantees a whole free meta whenever admission passes,
+    and (b) the CoW block becomes the chain tail, so the SAME call's main
+    draw recovers the fresh meta's residual via its hint. Run at exact
+    boundary capacity so any future reordering fails loudly here instead
+    of probabilistically near pool exhaustion in production."""
+    from vllm.v1.core.kv_cache_utils import (
+        BlockHash,
+        make_block_hash_with_group_id,
+    )
+
+    n = 4
+    manager, pool = _make_hierarchical_attention_manager(large_block_factor=n)
+    block_size = manager.block_size
+
+    # A cached, evictable, PARTIALLY-hit block inside a PARTIAL meta (a
+    # sibling stays in use, so touching the hit costs 0 ledger units and
+    # the meta cannot recycle).
+    first_two = pool.get_new_blocks(2)
+    cached, _sibling_in_use = first_two[0], first_two[1]
+    key = make_block_hash_with_group_id(BlockHash(b"cow-prefix"), 0)
+    cached.set_block_hash(key, num_tokens=None)
+    pool.cached_block_hash_to_block.insert(key, cached)
+    pool.free_blocks([cached])
+    cached_list = [cached]
+
+    # Drain: leave exactly ONE whole free meta.
+    held = []
+    while pool.get_num_free_large_blocks() > 1:
+        held.append(pool.get_new_blocks(1, large_block=True)[0])
+    free_small = pool.get_num_free_blocks()
+    assert free_small == n
+
+    # Partial hit of half a block + enough new tokens to need 3 new blocks:
+    # admission counts 3 new + 1 CoW + touch cost 0 (partial meta) = 4 <= 4.
+    hit_tokens = block_size // 2
+    total_tokens = hit_tokens + 3 * block_size
+    need = manager.get_num_blocks_to_allocate(
+        request_id="r",
+        num_tokens=total_tokens,
+        new_computed_blocks=cached_list,
+        total_computed_tokens=hit_tokens,
+        num_local_computed_tokens=hit_tokens,
+        num_tokens_main_model=total_tokens,
+    )
+    assert need == 4  # 3 new + 1 CoW + 0 touch (partial meta)
+    assert need <= free_small
+
+    # Full allocate sequence: add hits (touch), then allocate (CoW draw
+    # opens the last free meta; main draw must recover its residual).
+    manager.add_local_computed_blocks(
+        request_id="r",
+        new_computed_blocks=cached_list,
+        num_local_computed_tokens=hit_tokens,
+        num_external_computed_tokens=0,
+    )
+    new_blocks = manager.allocate_new_blocks(
+        request_id="r",
+        num_tokens=total_tokens,
+        num_tokens_main_model=total_tokens,
+    )
+    # No ValueError = the compensation held; the request got its blocks.
+    assert len(manager.req_to_blocks["r"]) >= 4
+    assert len(new_blocks) >= 3
