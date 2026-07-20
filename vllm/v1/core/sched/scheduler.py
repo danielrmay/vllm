@@ -322,7 +322,23 @@ class Scheduler(SchedulerInterface):
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
         kv_transfer_config = vllm_config.kv_transfer_config
+        # The per-group MAX hit shortcut below (waiting-queue scheduling) is
+        # only sound when the connector transfers the mamba state for the
+        # full claimed prefix unconditionally (NIXL P/D disagg does, via
+        # _apply_prefix_caching in nixl/worker.py). For any other connector
+        # (e.g. CPU offloading), claiming the attention-only hit resumes the
+        # request with a NULL mamba state and silently poisons every state
+        # it caches downstream.
         connector_names = _configured_connector_names(kv_transfer_config)
+        # ALL configured connectors must transfer the full mamba state for
+        # the per-group MAX hit shortcut to be sound: in a mixed
+        # MultiConnector (e.g. NIXL + CPU offloading) the load may be served
+        # by the sub-connector that does NOT ship state, recreating the
+        # silent-poison path the gate exists to prevent.
+        loadable = [n for n in connector_names if n != "MultiConnector"]
+        self._connector_transfers_full_mamba_state = bool(loadable) and all(
+            "Nixl" in name for name in loadable
+        )
         # The hierarchy factor must come from kv_cache_config's specs, NOT
         # from cache_config: _align_hybrid_block_size stamps
         # cache_config.mamba_large_block_factor in the WORKER process, and
@@ -772,6 +788,7 @@ class Scheduler(SchedulerInterface):
                     # Get locally-cached tokens.
                     if (
                         self.connector is not None
+                        and self._connector_transfers_full_mamba_state
                         and self.has_mamba_layers
                         and isinstance(
                             self.kv_cache_manager.coordinator,
