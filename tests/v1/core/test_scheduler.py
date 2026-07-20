@@ -5373,31 +5373,69 @@ def test_connector_transfers_full_mamba_state_flag():
 def test_mixed_multiconnector_does_not_claim_full_state():
     """A MultiConnector mixing NIXL with a non-full-state sub-connector must
     NOT enable the per-group MAX shortcut: the load may be served by the
-    sub-connector that does not ship mamba state."""
+    sub-connector that does not ship mamba state. Asserts on the scheduler's
+    own flag so predicate drift cannot pass unnoticed."""
     from vllm.config import KVTransferConfig
-    from vllm.v1.core.sched.scheduler import _configured_connector_names
 
-    mixed = KVTransferConfig(
-        kv_connector="MultiConnector",
-        kv_role="kv_both",
-        kv_connector_extra_config={
-            "connectors": [
-                {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
-                {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"},
-            ]
-        },
-    )
-    names = [n for n in _configured_connector_names(mixed) if n != "MultiConnector"]
-    assert not (bool(names) and all("Nixl" in n for n in names))
+    def multi(connectors):
+        return KVTransferConfig(
+            kv_connector="MultiConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "connectors": [
+                    {
+                        "kv_connector": name,
+                        "kv_role": "kv_both",
+                        "kv_connector_extra_config": extra,
+                    }
+                    for name, extra in connectors
+                ]
+            },
+        )
 
-    nixl_only = KVTransferConfig(
-        kv_connector="MultiConnector",
-        kv_role="kv_both",
-        kv_connector_extra_config={
-            "connectors": [{"kv_connector": "NixlConnector", "kv_role": "kv_both"}]
-        },
+    example = {"shared_storage_path": "local_storage"}
+    mixed = create_scheduler(
+        use_kv_connector=multi([("NixlConnector", {}), ("ExampleConnector", example)])
     )
-    names = [
-        n for n in _configured_connector_names(nixl_only) if n != "MultiConnector"
-    ]
-    assert bool(names) and all("Nixl" in n for n in names)
+    assert not mixed._connector_transfers_full_mamba_state
+
+    nixl_only = create_scheduler(use_kv_connector=multi([("NixlConnector", {})]))
+    assert nixl_only._connector_transfers_full_mamba_state
+
+
+def test_hierarchical_pool_refuses_kv_connectors():
+    """No KV transfer connector supports the hierarchical pool's mamba
+    geometry yet (the offloading connector cannot store span states; P/D
+    connectors' region registration assumes the flat layout), so ANY
+    configured connector with large_block_factor > 1 must refuse loudly at
+    init. Flat (factor == 1) and connector-less configs must construct."""
+    import torch
+
+    from vllm.config import KVTransferConfig
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    def mamba_spec(factor):
+        return MambaSpec(
+            block_size=16,
+            shapes=((64, 64),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            large_block_factor=factor,
+        )
+
+    offload_cfg = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"cpu_bytes_to_use": 1 << 30},
+    )
+    for connector in ("NixlConnector", offload_cfg):
+        with pytest.raises(NotImplementedError, match="hierarchical mamba pool"):
+            create_scheduler(use_kv_connector=connector, kv_cache_spec=mamba_spec(4))
+
+    scheduler = create_scheduler(
+        use_kv_connector=offload_cfg, kv_cache_spec=mamba_spec(1)
+    )
+    assert scheduler.mamba_large_block_factor == 1
+
+    scheduler = create_scheduler(kv_cache_spec=mamba_spec(4))
+    assert scheduler.mamba_large_block_factor == 4
