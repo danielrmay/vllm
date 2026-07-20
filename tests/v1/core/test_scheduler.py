@@ -5329,3 +5329,75 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.status == RequestStatus.WAITING
     assert b.num_preemptions == 0
     assert b.request_id not in req_to_blocks
+
+
+def test_configured_connector_names_sees_through_multiconnector():
+    """Connector-gated behavior (mamba split alignment, the NIXL full-state
+    shortcut) must recognize sub-connectors inside MultiConnector; matching
+    only the top-level name silently disables the gated features."""
+    from vllm.config import KVTransferConfig
+    from vllm.v1.core.sched.scheduler import _configured_connector_names
+
+    assert _configured_connector_names(None) == []
+    plain = KVTransferConfig(kv_connector="OffloadingConnector", kv_role="kv_both")
+    assert _configured_connector_names(plain) == ["OffloadingConnector"]
+    multi = KVTransferConfig(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+                {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"},
+            ]
+        },
+    )
+    names = _configured_connector_names(multi)
+    assert "OffloadingConnector" in names and "NixlConnector" in names
+
+
+def test_connector_transfers_full_mamba_state_flag():
+    """The per-group MAX hit shortcut is only sound for connectors that
+    transfer the mamba state for the full claimed prefix (NIXL). Pin the
+    flag: True for NIXL (also inside MultiConnector), False for the
+    offloading connector and for no connector."""
+    scheduler = create_scheduler(use_kv_connector="NixlConnector")
+    assert scheduler._connector_transfers_full_mamba_state
+
+    scheduler = create_scheduler(use_kv_connector=True)  # ExampleConnector
+    assert not scheduler._connector_transfers_full_mamba_state
+
+    scheduler = create_scheduler()
+    assert not scheduler._connector_transfers_full_mamba_state
+
+
+def test_mixed_multiconnector_does_not_claim_full_state():
+    """A MultiConnector mixing NIXL with a non-full-state sub-connector must
+    NOT enable the per-group MAX shortcut: the load may be served by the
+    sub-connector that does not ship mamba state."""
+    from vllm.config import KVTransferConfig
+    from vllm.v1.core.sched.scheduler import _configured_connector_names
+
+    mixed = KVTransferConfig(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+                {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"},
+            ]
+        },
+    )
+    names = [n for n in _configured_connector_names(mixed) if n != "MultiConnector"]
+    assert not (bool(names) and all("Nixl" in n for n in names))
+
+    nixl_only = KVTransferConfig(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "connectors": [{"kv_connector": "NixlConnector", "kv_role": "kv_both"}]
+        },
+    )
+    names = [
+        n for n in _configured_connector_names(nixl_only) if n != "MultiConnector"
+    ]
+    assert bool(names) and all("Nixl" in n for n in names)
