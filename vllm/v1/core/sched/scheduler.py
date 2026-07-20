@@ -8,7 +8,7 @@ from dataclasses import replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
-from vllm.config import VllmConfig
+from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -54,7 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -65,6 +65,24 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _configured_connector_names(
+    kv_transfer_config: KVTransferConfig | None,
+) -> list[str]:
+    """All configured KV connector names, looking through MultiConnector.
+
+    Gating on the top-level name alone silently disables connector-aware
+    behavior for MultiConnector-wrapped deployments (the sub-connectors live
+    in ``kv_connector_extra_config["connectors"]``).
+    """
+    if kv_transfer_config is None:
+        return []
+    names = [kv_transfer_config.kv_connector or ""]
+    if names[0] == "MultiConnector":
+        extra = kv_transfer_config.kv_connector_extra_config or {}
+        names.extend(sub.get("kv_connector", "") for sub in extra.get("connectors", []))
+    return names
 
 
 class Scheduler(SchedulerInterface):
@@ -303,6 +321,48 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        kv_transfer_config = vllm_config.kv_transfer_config
+        connector_names = _configured_connector_names(kv_transfer_config)
+        # The hierarchy factor must come from kv_cache_config's specs, NOT
+        # from cache_config: _align_hybrid_block_size stamps
+        # cache_config.mamba_large_block_factor in the WORKER process, and
+        # only block_size is synced back — in the scheduler's process the
+        # cache_config copy stays at its default of 1. The specs are built
+        # worker-side and returned through the executor, so they carry the
+        # resolved value.
+        mamba_factors = {
+            group.kv_cache_spec.large_block_factor
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        }
+        # Today the factor is stamped from a single cache_config value, so
+        # all mamba groups agree by construction. The scheduler tracks ONE
+        # hierarchy factor (admission scaling and the connector guards
+        # assume it), so fail loudly if that ever changes.
+        if len(mamba_factors) > 1:
+            # Config-shape validation must survive python -O (asserts do not).
+            raise ValueError(
+                f"Mamba KV groups disagree on large_block_factor "
+                f"({sorted(mamba_factors)}); the scheduler assumes a "
+                f"single hierarchy factor."
+            )
+        self.mamba_large_block_factor = mamba_factors.pop() if mamba_factors else 1
+        if self.mamba_large_block_factor > 1 and loadable:
+            # No KV transfer connector supports the hierarchical pool's
+            # mamba geometry yet: the offloading connector cannot store
+            # states (they only materialize at chunk ends it has no say
+            # over), and P/D connectors' region registration and block-id
+            # mapping still assume the flat small-block layout (e.g. NIXL
+            # sizes the mamba region by the small-block count in
+            # nixl/base_worker.py). Refuse loudly rather than corrupt or
+            # crash at transfer time; flat (factor == 1) and "all" modes
+            # are unaffected.
+            raise NotImplementedError(
+                "KV transfer connectors are not yet supported with a "
+                "hierarchical mamba pool (large_block_factor > 1); "
+                f"configured: {loadable}. Serve without KV "
+                "connectors or use --mamba-cache-mode all."
+            )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.

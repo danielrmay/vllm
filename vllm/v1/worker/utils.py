@@ -540,7 +540,7 @@ def bind_kv_cache(
 
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
-    num_blocks: int,
+    page_size: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
 ) -> None:
     if not kv_cache_block_copies:
@@ -566,15 +566,33 @@ def copy_kv_cache_blocks_inplace(
     indices = async_tensor_h2d(indices_np, device=device)
     src_indices, dst_indices = indices.unbind(dim=1)
 
+    # ``page_size`` is the pool's uniform SMALL page, supplied by the caller
+    # from the KV cache specs (deriving it from storage sizes is ambiguous: a
+    # short storage's byte count can coincidentally divide a block count). A
+    # hierarchical mamba storage can be SHORTER than the pool (its state
+    # slots cover only the factor-aligned prefix), so each tensor is viewed
+    # by however many whole pages it holds and copies aimed past its range
+    # are skipped — those block ids hold no data in that storage.
     for tensor in storage_tensors:
         assert tensor.device == device
         blocks = torch.empty(0, dtype=torch.uint8, device=device)
         blocks.set_(tensor.untyped_storage())
         # Block-major backing storage: block i owns the contiguous byte range
         # [i * page_size, (i + 1) * page_size).
-        assert blocks.numel() % num_blocks == 0
-        blocks = blocks.view(num_blocks, -1)
-        blocks[dst_indices] = blocks[src_indices]
+        num_rows = blocks.numel() // page_size
+        blocks = torch.as_strided(blocks, (num_rows, page_size), (page_size, 1))
+        # Defensive under current invariants (mamba-relevant copies always
+        # land within a short storage's factor-aligned prefix). Note the
+        # skip is silent for ALL storages — a wrong page_size on a
+        # full-size storage truncates instead of failing; acceptable while
+        # every caller derives page_size from the specs. The .all() device
+        # sync happens once per storage tensor (i.e. per layer) per CoW
+        # batch — rare (prefill partial hits), never per decode step.
+        in_range = (src_indices < num_rows) & (dst_indices < num_rows)
+        if bool(in_range.all()):
+            blocks[dst_indices] = blocks[src_indices]
+        else:
+            blocks[dst_indices[in_range]] = blocks[src_indices[in_range]]
 
 
 def is_residual_scattered_for_sp(

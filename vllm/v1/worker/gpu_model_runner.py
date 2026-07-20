@@ -149,6 +149,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -1197,9 +1198,15 @@ class GPUModelRunner(
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
         if scheduler_output.kv_cache_block_copies:
+            page_size = getattr(self, "_cow_uniform_page_size", None)
+            if page_size is None:
+                page_size = get_uniform_page_size(
+                    [g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups]
+                )
+                self._cow_uniform_page_size = page_size
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
-                self.kv_cache_config.num_blocks,
+                page_size,
                 scheduler_output.kv_cache_block_copies,
             )
 
@@ -7383,12 +7390,15 @@ class GPUModelRunner(
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     state_tensors = []
                     storage_offset_bytes = 0
+                    # In hierarchical mode (large_block_factor > 1), the mamba
+                    # view has one slot per ``N`` consecutive small attention
+                    # blocks.
+                    num_state_slots = num_blocks // kv_cache_spec.large_block_factor
+                    state_page_bytes = kv_cache_spec.state_page_size_bytes
                     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                         dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
-                        )
-                        target_shape = (num_blocks, *shape)
+                        num_element_per_page = state_page_bytes // dtype_size
+                        target_shape = (num_state_slots, *shape)
                         stride = torch.empty(target_shape).stride()
                         target_stride = (num_element_per_page, *stride[1:])
                         assert storage_offset_bytes % dtype_size == 0

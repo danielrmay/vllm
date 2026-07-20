@@ -25,6 +25,42 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 logger = init_logger(__name__)
 
 
+def _group_factor(spec: Any) -> int:
+    return spec.large_block_factor if isinstance(spec, MambaSpec) else 1
+
+
+def _group_id_limits(model_runner: GPUModelRunner, kv_cache_groups: Any) -> list[int]:
+    """Highest addressable block id (exclusive) per KV group: attention
+    groups address [0, num_blocks) small ids, a hierarchical mamba group's
+    state view has only num_blocks // large_block_factor rows."""
+    num_blocks = model_runner.kv_cache_config.num_blocks
+    return [num_blocks // _group_factor(g.kv_cache_spec) for g in kv_cache_groups]
+
+
+def _make_group_block_allocator(group_id_limits: list[int]):
+    """Per-group sequential block-id allocator (0 is the null block).
+
+    Warmup ids must stay inside each group's addressable range — a single
+    shared counter bounded by the small-block count hands a hierarchical
+    mamba group ids past the end of its state tensor.
+    """
+    next_block_ids = [1] * len(group_id_limits)
+
+    def _alloc_blocks(group_idx: int, num_blocks: int) -> list[int]:
+        start = next_block_ids[group_idx]
+        end = start + num_blocks
+        if end > group_id_limits[group_idx]:
+            raise ValueError(
+                f"V2 warmup overran KV group {group_idx}'s block-id space "
+                f"({end - 1} > {group_id_limits[group_idx] - 1}); the "
+                "warmup sizing check should have prevented this."
+            )
+        next_block_ids[group_idx] = end
+        return list(range(start, end))
+
+    return _alloc_blocks
+
+
 def run_mixed_prefill_decode_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -48,38 +84,43 @@ def run_mixed_prefill_decode_warmup(
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
-    group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
+    # A hierarchical mamba group allocates whole state spans (block_size x
+    # large_block_factor tokens per row), and its state view has only
+    # num_blocks // large_block_factor rows — both the per-request row
+    # counts and the id range differ from the attention groups'.
+    group_alloc_sizes = [
+        g.kv_cache_spec.block_size * _group_factor(g.kv_cache_spec)
+        for g in kv_cache_groups
+    ]
     decode_prefill_block_counts = [
-        cdiv(decode_prompt_len, block_size) for block_size in group_block_sizes
+        cdiv(decode_prompt_len, alloc_size) for alloc_size in group_alloc_sizes
     ]
     decode_block_counts = [
-        cdiv(decode_prompt_len + decode_scheduled_tokens, block_size)
-        for block_size in group_block_sizes
+        cdiv(decode_prompt_len + decode_scheduled_tokens, alloc_size)
+        for alloc_size in group_alloc_sizes
     ]
     decode_block_deltas = [
         decode - prefill
         for decode, prefill in zip(decode_block_counts, decode_prefill_block_counts)
     ]
     prefill_block_counts = [
-        cdiv(prefill_len, block_size) for block_size in group_block_sizes
+        cdiv(prefill_len, alloc_size) for alloc_size in group_alloc_sizes
     ]
-    required_blocks = sum(decode_block_counts) + sum(prefill_block_counts)
-    if model_runner.kv_cache_config.num_blocks <= required_blocks:
-        logger.warning(
-            "Skipping V2 mixed prefill+decode warmup because only %d KV blocks "
-            "are available for %d required warmup blocks.",
-            model_runner.kv_cache_config.num_blocks,
-            required_blocks,
-        )
-        return False
+    group_id_limits = _group_id_limits(model_runner, kv_cache_groups)
+    for limit, decode_count, prefill_count in zip(
+        group_id_limits, decode_block_counts, prefill_block_counts
+    ):
+        if limit <= decode_count + prefill_count:
+            logger.warning(
+                "Skipping V2 mixed prefill+decode warmup because a KV group "
+                "has only %d addressable blocks for %d required warmup "
+                "blocks.",
+                limit,
+                decode_count + prefill_count,
+            )
+            return False
 
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        block_ids = list(range(next_block_id, next_block_id + num_blocks))
-        next_block_id += num_blocks
-        return block_ids
+    _alloc_blocks = _make_group_block_allocator(group_id_limits)
 
     sampling_params = SamplingParams(max_tokens=2, temperature=0.0)
 
@@ -91,7 +132,9 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in decode_prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(g, n) for g, n in enumerate(decode_prefill_block_counts)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=decode_token_ids,
@@ -103,7 +146,9 @@ def run_mixed_prefill_decode_warmup(
     decode_prefill_output.total_num_scheduled_tokens = decode_prompt_len
     decode_prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
-    decode_new_blocks = tuple(_alloc_blocks(n) for n in decode_block_deltas)
+    decode_new_blocks = tuple(
+        _alloc_blocks(g, n) for g, n in enumerate(decode_block_deltas)
+    )
     cached_decode_req = CachedRequestData.make_empty()
     cached_decode_req.req_ids = [decode_req_id]
     cached_decode_req.num_computed_tokens = [decode_prompt_len]
@@ -121,7 +166,9 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(g, n) for g, n in enumerate(prefill_block_counts)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=prefill_token_ids,
@@ -198,7 +245,9 @@ def warmup_kernels(
     def _warmup_block_count(num_tokens: int, spec: Any) -> int:
         if isinstance(spec, CrossAttentionSpec):
             num_tokens = max_encoder_len
-        num_blocks = cdiv(num_tokens, spec.block_size)
+        # A hierarchical mamba group allocates whole state spans
+        # (block_size x large_block_factor tokens per block-table row).
+        num_blocks = cdiv(num_tokens, spec.block_size * _group_factor(spec))
         if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
             # Align mode reserves extra blocks beyond the token range for the
             # speculative-decode running-state snapshots.
@@ -211,14 +260,23 @@ def warmup_kernels(
     decode_block_deltas = [
         d - p for d, p in zip(decode_block_counts, prefill_block_counts)
     ]
-    max_blocks_per_req = sum(decode_block_counts)
+    group_id_limits = _group_id_limits(model_runner, kv_cache_groups)
 
     num_reqs = min(
         model_runner.scheduler_config.max_num_seqs,
         model_runner.scheduler_config.max_num_batched_tokens
         // max(prompt_len, decode_query_len),
-        # Reserve block 0 (null block) and ensure we have enough blocks.
-        max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
+        # Reserve block 0 (null block) and stay inside every group's
+        # addressable id range (a hierarchical mamba group has only
+        # num_blocks // large_block_factor rows).
+        max(
+            1,
+            min(
+                (limit - 1) // count
+                for limit, count in zip(group_id_limits, decode_block_counts)
+                if count > 0
+            ),
+        ),
     )
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
@@ -231,12 +289,9 @@ def warmup_kernels(
         sampling_params = SamplingParams.for_sampler_warmup()
         pooling_params = None
 
-    # Assign distinct block IDs per request per group. 0 null block, start from 1.
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+    # Assign distinct block IDs per request per group. 0 null block, start
+    # from 1; each group allocates within its own addressable id range.
+    _alloc_blocks = _make_group_block_allocator(group_id_limits)
 
     # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
     new_reqs = [
@@ -248,7 +303,9 @@ def warmup_kernels(
                 pooling_params,
                 mm_features=warmup_mm_features,
             ),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(g, n) for g, n in enumerate(prefill_block_counts)
+            ),
             prefill_token_ids=prompt_token_ids,
         )
         for i in range(num_reqs)
@@ -289,7 +346,9 @@ def warmup_kernels(
         cached_req_data.num_output_tokens = [1] * num_reqs
         new_block = any(decode_block_deltas)
         cached_req_data.new_block_ids = [
-            tuple(_alloc_blocks(n) for n in decode_block_deltas) if new_block else None
+            tuple(_alloc_blocks(g, n) for g, n in enumerate(decode_block_deltas))
+            if new_block
+            else None
             for _ in range(num_reqs)
         ]
 

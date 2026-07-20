@@ -742,17 +742,34 @@ class KVCacheManager:
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
         """Drain pending copies and return their retained endpoints."""
-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        large_block_factor = self.coordinator.block_pool.large_block_factor
+        copies: list[KVCacheBlockCopy] = []
+        retained_blocks: list[KVCacheBlock] = []
         for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
-        copies = [
-            KVCacheBlockCopy(
-                src_block_id=source_block.block_id,
-                dst_block_id=cow_block.block_id,
-            )
-            for source_block, cow_block in pending_copies
-        ]
-        retained_blocks = [block for pair in pending_copies for block in pair]
+            for source_block, cow_block in mgr.take_pending_cow_copies():
+                retained_blocks.extend((source_block, cow_block))
+                if mgr.is_large_block and large_block_factor > 1:
+                    # Hierarchical pool: this manager's ids are LARGE ids,
+                    # but the worker's copy kernel views the backing storage
+                    # as small-page-major. One state slot spans exactly
+                    # ``large_block_factor`` consecutive small pages, so emit
+                    # one copy per small page.
+                    copies.extend(
+                        KVCacheBlockCopy(
+                            src_block_id=(
+                                source_block.block_id * large_block_factor + j
+                            ),
+                            dst_block_id=(cow_block.block_id * large_block_factor + j),
+                        )
+                        for j in range(large_block_factor)
+                    )
+                else:
+                    copies.append(
+                        KVCacheBlockCopy(
+                            src_block_id=source_block.block_id,
+                            dst_block_id=cow_block.block_id,
+                        )
+                    )
         return copies, retained_blocks
 
     def new_step_starts(self) -> None:
