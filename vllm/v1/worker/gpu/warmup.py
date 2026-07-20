@@ -25,6 +25,105 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 logger = init_logger(__name__)
 
 
+def _group_factor(spec: Any) -> int:
+    return spec.large_block_factor if isinstance(spec, MambaSpec) else 1
+
+
+def _is_sparse_align_mamba(spec: Any) -> bool:
+    return (
+        isinstance(spec, MambaSpec)
+        and spec.mamba_cache_mode == "align"
+        and spec.large_block_factor > 1
+    )
+
+
+def _group_id_limits(model_runner: GPUModelRunner, kv_cache_groups: Any) -> list[int]:
+    """Highest addressable block id (exclusive) per KV group: attention
+    groups address [0, num_blocks) small ids, a hierarchical mamba group's
+    state view has only num_blocks // large_block_factor rows."""
+    num_blocks = model_runner.kv_cache_config.num_blocks
+    return [num_blocks // _group_factor(g.kv_cache_spec) for g in kv_cache_groups]
+
+
+def _group_table_shape(spec: Any, num_tokens: int) -> tuple[int, int]:
+    """(table_rows, real_ids_consumed) for one request's warmup block table.
+
+    Align-mode hierarchical mamba tables are FINE-granularity and sparse at
+    runtime: one row per ``spec.block_size`` tokens, null everywhere except
+    the state-slot position (plus appended speculative snapshot slots) —
+    see ``MambaManager`` align allocation and its shape test. A dense
+    span-granularity table would leave the backend's row lookups in the
+    zero padding, resolving every warmup request to the null state slot.
+    Other groups use dense tables: one real id per allocation unit
+    (``block_size`` x factor tokens).
+    """
+    if _is_sparse_align_mamba(spec):
+        rows = cdiv(num_tokens, spec.block_size)
+        real = 1 + spec.num_speculative_blocks
+        return rows, real
+    rows = cdiv(num_tokens, spec.block_size * _group_factor(spec))
+    if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+        # Flat align (factor == 1): snapshot slots append as real rows.
+        rows += spec.num_speculative_blocks
+    return rows, rows
+
+
+def _make_group_table_builder(kv_cache_specs: list[Any], group_id_limits: list[int]):
+    """Per-group warmup block-table builder (0 is the null block).
+
+    Small-granularity (factor == 1) groups share ONE sequential counter:
+    their ids must be globally distinct across groups, exactly like the
+    real scheduler's single global pool — different groups' layers can
+    share backing tensors, so per-group counters restarting at 1 would
+    alias rows and let later layers overwrite earlier layers' warmup KV.
+    Hierarchical mamba groups (factor > 1) get per-group counters bounded
+    by their smaller state range (num_blocks // factor). Their slots DO
+    overlay small ids in shared buffers (each KVCacheTensor is shared by
+    one layer per group), so cross-granularity aliasing does occur during
+    warmup — harmless because warmup values are never read for
+    correctness: warmup blocks never enter the pool or prefix cache, and
+    serving writes before reading. Only equal-granularity groups sharing
+    one id space need globally distinct ids, to keep warmup
+    shape-faithful. Sparse align-mamba tables get nulls at non-state positions,
+    a real state-slot id at the last token-range row, and the speculative
+    snapshot slots appended (approximating the manager's "state slot at
+    the last computed index" shape).
+    """
+    shared_small_next = [1]
+    per_group_next = [1] * len(group_id_limits)
+
+    def _take_ids(group_idx: int, count: int) -> list[int]:
+        if _group_factor(kv_cache_specs[group_idx]) == 1:
+            counter, key = shared_small_next, 0
+        else:
+            counter, key = per_group_next, group_idx
+        start = counter[key]
+        end = start + count
+        if end > group_id_limits[group_idx]:
+            raise ValueError(
+                f"V2 warmup overran KV group {group_idx}'s block-id space "
+                f"({end - 1} > {group_id_limits[group_idx] - 1}); the "
+                "warmup sizing check should have prevented this."
+            )
+        counter[key] = end
+        return list(range(start, end))
+
+    def _build_table(group_idx: int, num_tokens: int) -> list[int]:
+        spec = kv_cache_specs[group_idx]
+        rows, real = _group_table_shape(spec, num_tokens)
+        if not _is_sparse_align_mamba(spec):
+            return _take_ids(group_idx, rows)
+        ids = _take_ids(group_idx, real)
+        return [0] * (rows - 1) + [ids[0]] + ids[1:]
+
+    def _build_delta_rows(group_idx: int, num_rows: int) -> list[int]:
+        # Appended decode rows: small counts, all real distinct ids
+        # (budgeted in ids_per_req; sparse groups rarely have deltas).
+        return _take_ids(group_idx, num_rows) if num_rows > 0 else []
+
+    return _build_table, _build_delta_rows
+
+
 def run_mixed_prefill_decode_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -48,38 +147,49 @@ def run_mixed_prefill_decode_warmup(
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
-    group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
-    decode_prefill_block_counts = [
-        cdiv(decode_prompt_len, block_size) for block_size in group_block_sizes
+    kv_cache_specs = [g.kv_cache_spec for g in kv_cache_groups]
+    # Table rows and consumed real ids differ per group (sparse align-mamba
+    # tables consume 1 + spec ids however many rows they have).
+    decode_prefill_rows = [
+        _group_table_shape(spec, decode_prompt_len)[0] for spec in kv_cache_specs
     ]
-    decode_block_counts = [
-        cdiv(decode_prompt_len + decode_scheduled_tokens, block_size)
-        for block_size in group_block_sizes
+    decode_rows = [
+        _group_table_shape(spec, decode_prompt_len + decode_scheduled_tokens)[0]
+        for spec in kv_cache_specs
     ]
-    decode_block_deltas = [
-        decode - prefill
-        for decode, prefill in zip(decode_block_counts, decode_prefill_block_counts)
+    decode_row_deltas = [
+        decode - prefill for decode, prefill in zip(decode_rows, decode_prefill_rows)
     ]
-    prefill_block_counts = [
-        cdiv(prefill_len, block_size) for block_size in group_block_sizes
-    ]
-    required_blocks = sum(decode_block_counts) + sum(prefill_block_counts)
-    if model_runner.kv_cache_config.num_blocks <= required_blocks:
-        logger.warning(
-            "Skipping V2 mixed prefill+decode warmup because only %d KV blocks "
-            "are available for %d required warmup blocks.",
-            model_runner.kv_cache_config.num_blocks,
-            required_blocks,
+    group_id_limits = _group_id_limits(model_runner, kv_cache_groups)
+    # The decode request's prefill table + its appended delta rows + the
+    # prefill request's table (decode-length shape would double count the
+    # delta for dense groups). Small-granularity groups draw from ONE
+    # shared id space, so their demand SUMS; hierarchical mamba groups
+    # check their own per-group ranges.
+    shared_small_required = 0
+    for group_idx, (spec, limit) in enumerate(zip(kv_cache_specs, group_id_limits)):
+        required_ids = (
+            _group_table_shape(spec, decode_prompt_len)[1]
+            + decode_row_deltas[group_idx]
+            + _group_table_shape(spec, prefill_len)[1]
         )
-        return False
+        if _group_factor(spec) == 1:
+            shared_small_required += required_ids
+            required_ids = shared_small_required
+        if limit <= required_ids:
+            logger.warning(
+                "Skipping V2 mixed prefill+decode warmup because KV group "
+                "%d has only %d addressable blocks for %d required warmup "
+                "blocks.",
+                group_idx,
+                limit,
+                required_ids,
+            )
+            return False
 
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        block_ids = list(range(next_block_id, next_block_id + num_blocks))
-        next_block_id += num_blocks
-        return block_ids
+    _build_table, _build_delta_rows = _make_group_table_builder(
+        kv_cache_specs, group_id_limits
+    )
 
     sampling_params = SamplingParams(max_tokens=2, temperature=0.0)
 
@@ -91,7 +201,9 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in decode_prefill_block_counts),
+            block_ids=tuple(
+                _build_table(g, decode_prompt_len) for g in range(num_kv_cache_groups)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=decode_token_ids,
@@ -103,13 +215,15 @@ def run_mixed_prefill_decode_warmup(
     decode_prefill_output.total_num_scheduled_tokens = decode_prompt_len
     decode_prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
-    decode_new_blocks = tuple(_alloc_blocks(n) for n in decode_block_deltas)
+    decode_new_blocks = tuple(
+        _build_delta_rows(g, n) for g, n in enumerate(decode_row_deltas)
+    )
     cached_decode_req = CachedRequestData.make_empty()
     cached_decode_req.req_ids = [decode_req_id]
     cached_decode_req.num_computed_tokens = [decode_prompt_len]
     cached_decode_req.num_output_tokens = [1]
     cached_decode_req.new_block_ids = [
-        decode_new_blocks if any(decode_block_deltas) else None
+        decode_new_blocks if any(decode_row_deltas) else None
     ]
 
     mixed_output = SchedulerOutput.make_empty()
@@ -121,7 +235,9 @@ def run_mixed_prefill_decode_warmup(
             mm_features=[],
             sampling_params=sampling_params,
             pooling_params=None,
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _build_table(g, prefill_len) for g in range(num_kv_cache_groups)
+            ),
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=prefill_token_ids,
@@ -194,32 +310,63 @@ def warmup_kernels(
             )
         ]
 
-    # Compute per-request block counts for each KV cache group.
-    def _warmup_block_count(num_tokens: int, spec: Any) -> int:
-        if isinstance(spec, CrossAttentionSpec):
-            num_tokens = max_encoder_len
-        num_blocks = cdiv(num_tokens, spec.block_size)
-        if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
-            # Align mode reserves extra blocks beyond the token range for the
-            # speculative-decode running-state snapshots.
-            num_blocks += spec.num_speculative_blocks
-        return num_blocks
-
     kv_cache_specs = [g.kv_cache_spec for g in kv_cache_groups]
-    prefill_block_counts = [_warmup_block_count(prompt_len, s) for s in kv_cache_specs]
-    decode_block_counts = [_warmup_block_count(decode_len, s) for s in kv_cache_specs]
-    decode_block_deltas = [
-        d - p for d, p in zip(decode_block_counts, prefill_block_counts)
-    ]
-    max_blocks_per_req = sum(decode_block_counts)
 
+    def _group_tokens(num_tokens: int, spec: Any) -> int:
+        # Cross-attention tables always cover the encoder length.
+        return max_encoder_len if isinstance(spec, CrossAttentionSpec) else num_tokens
+
+    prefill_rows = [
+        _group_table_shape(spec, _group_tokens(prompt_len, spec))[0]
+        for spec in kv_cache_specs
+    ]
+    decode_rows = [
+        _group_table_shape(spec, _group_tokens(decode_len, spec))[0]
+        for spec in kv_cache_specs
+    ]
+    decode_row_deltas = [d - p for d, p in zip(decode_rows, prefill_rows)]
+    # Real ids one request consumes: its prefill table plus the appended
+    # decode delta rows (using the decode-length shape here would double
+    # count the delta for dense groups, shrinking num_reqs and skipping
+    # warmup on small-but-sufficient caches).
+    ids_per_req = [
+        _group_table_shape(spec, _group_tokens(prompt_len, spec))[1] + delta
+        for spec, delta in zip(kv_cache_specs, decode_row_deltas)
+    ]
+    group_id_limits = _group_id_limits(model_runner, kv_cache_groups)
+
+    # Reserve block 0 (null block) and stay inside every id space: the
+    # small-granularity groups SHARE one space (their per-request ids sum),
+    # while each hierarchical mamba group has its own
+    # num_blocks // large_block_factor range.
+    shared_small_ids_per_req = sum(
+        ids
+        for spec, ids in zip(kv_cache_specs, ids_per_req)
+        if _group_factor(spec) == 1
+    )
+    id_space_bounds = [
+        (limit - 1) // ids
+        for spec, limit, ids in zip(kv_cache_specs, group_id_limits, ids_per_req)
+        if _group_factor(spec) > 1 and ids > 0
+    ]
+    if shared_small_ids_per_req > 0:
+        id_space_bounds.append(
+            (model_runner.kv_cache_config.num_blocks - 1) // shared_small_ids_per_req
+        )
     num_reqs = min(
         model_runner.scheduler_config.max_num_seqs,
         model_runner.scheduler_config.max_num_batched_tokens
         // max(prompt_len, decode_query_len),
-        # Reserve block 0 (null block) and ensure we have enough blocks.
-        max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
+        min(id_space_bounds) if id_space_bounds else 1,
     )
+    if num_reqs < 1:
+        # Mirror run_mixed_prefill_decode_warmup: skip gracefully rather
+        # than crash startup when a group cannot host even one request.
+        logger.warning(
+            "Skipping V2 kernel warmup because a KV group cannot host a "
+            "single warmup request within its addressable block-id range."
+        )
+        return
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
@@ -231,12 +378,11 @@ def warmup_kernels(
         sampling_params = SamplingParams.for_sampler_warmup()
         pooling_params = None
 
-    # Assign distinct block IDs per request per group. 0 null block, start from 1.
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+    # Assign distinct block IDs per request per group. 0 null block, start
+    # from 1; each group allocates within its own addressable id range.
+    _build_table, _build_delta_rows = _make_group_table_builder(
+        kv_cache_specs, group_id_limits
+    )
 
     # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
     new_reqs = [
@@ -248,7 +394,10 @@ def warmup_kernels(
                 pooling_params,
                 mm_features=warmup_mm_features,
             ),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _build_table(g, _group_tokens(prompt_len, kv_cache_specs[g]))
+                for g in range(num_kv_cache_groups)
+            ),
             prefill_token_ids=prompt_token_ids,
         )
         for i in range(num_reqs)
@@ -287,9 +436,11 @@ def warmup_kernels(
         cached_req_data.req_ids = list(req_ids)
         cached_req_data.num_computed_tokens = [prompt_len] * num_reqs
         cached_req_data.num_output_tokens = [1] * num_reqs
-        new_block = any(decode_block_deltas)
+        new_block = any(decode_row_deltas)
         cached_req_data.new_block_ids = [
-            tuple(_alloc_blocks(n) for n in decode_block_deltas) if new_block else None
+            tuple(_build_delta_rows(g, n) for g, n in enumerate(decode_row_deltas))
+            if new_block
+            else None
             for _ in range(num_reqs)
         ]
 
