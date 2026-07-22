@@ -365,15 +365,63 @@ class XPUPlatform(Platform):
         if new_block_size == cache_config.block_size:
             return
 
-        if cache_config.mamba_cache_mode == "align":
-            cache_config.mamba_block_size = new_block_size
         original_mamba_page_size_padded = cache_config.mamba_page_size_padded
-        if cache_config.mamba_page_size_padded is not None:
+        # Recompute the hierarchy factor from the STATE SPAN (factor x old
+        # block_size), never from mamba_block_size: in align mode
+        # mamba_block_size is the fine prefix-cache step (== old block_size),
+        # and in none mode it is max_model_len - neither is the span.
+        original_mamba_large_block_factor = cache_config.mamba_large_block_factor
+        if cache_config.mamba_large_block_factor > 1:
+            span = cache_config.mamba_large_block_factor * cache_config.block_size
+            # raise, not assert: must survive python -O. NOTE: legacy code
+            # served such configs by inflating the block to the span and
+            # re-rounding; a hierarchical equivalent exists (recompute the
+            # span at new_block_size granularity and grow the padded state
+            # page accordingly) but is deliberately NOT shipped untested —
+            # the author has no XPU hardware. XPU maintainers: input
+            # welcome.
+            if span % new_block_size != 0:
+                raise ValueError(
+                    f"mamba state span ({span}) is not divisible by the XPU "
+                    f"kernel-aligned block size ({new_block_size}); serve "
+                    "with --mamba-cache-mode all, or see the comment above "
+                    "for the untested re-span alternative"
+                )
+            cache_config.mamba_large_block_factor = span // new_block_size
+            if cache_config.mamba_cache_mode == "align":
+                # The fine prefix-cache step tracks the allocation block size.
+                cache_config.mamba_block_size = new_block_size
+        elif cache_config.mamba_cache_mode == "align":
+            # Align resolved WITHOUT a hierarchy (factor == 1, span == old
+            # block size): the fine step tracks the allocation block size,
+            # exactly as in the legacy unconditional re-alignment.
+            cache_config.mamba_block_size = new_block_size
+        elif cache_config.mamba_block_size is not None:
+            # Legacy flat layout ("all" mode): mamba_block_size IS the span.
+            # raise, not assert: must survive python -O.
+            if cache_config.mamba_block_size % new_block_size != 0:
+                raise ValueError(
+                    f"mamba_block_size ({cache_config.mamba_block_size}) is "
+                    "not divisible by the XPU kernel-aligned block size "
+                    f"({new_block_size})"
+                )
+        if (
+            cache_config.mamba_page_size_padded is not None
+            and original_mamba_large_block_factor == 1
+        ):
+            # Legacy flat layout: the padded state page tracks
+            # mamba_block_size (which IS the span there). Under a
+            # hierarchical pool the state byte size is invariant to the
+            # allocation block size, so the padded page stays as computed —
+            # gate on the ORIGINAL factor: a hierarchy whose factor collapses
+            # to exactly 1 (span == kernel-aligned block size) must also
+            # keep its span-invariant padded page.
             attn_page_size_1_token = (
                 cache_config.mamba_page_size_padded // cache_config.block_size
             )
+            assert cache_config.mamba_block_size is not None
             cache_config.mamba_page_size_padded = (
-                new_block_size * attn_page_size_1_token
+                cache_config.mamba_block_size * attn_page_size_1_token
             )
         cache_config.block_size = new_block_size
         logger.info(

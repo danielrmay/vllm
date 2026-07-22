@@ -128,6 +128,12 @@ class CacheConfig:
     """Size of a contiguous cache block in number of tokens for mamba cache.
     Can be set only when prefix caching is enabled.
     Value must be a multiple of 8 to align with causal_conv1d kernel."""
+    mamba_large_block_factor: int = Field(default=1, gt=0)
+    """Number `N` of attention `block_size`-sized blocks that one mamba block
+    spans in the shared backing tensor. `mamba_block_size = N * block_size`.
+    Set automatically by `_align_hybrid_block_size` (via
+    `check_and_update_config`); defaults to 1 for non-hybrid models.
+    Related: `MambaSpec.large_block_factor` (the spec-layer copy)."""
     mamba_cache_dtype: MambaDType = "auto"
     """The data type to use for the Mamba cache (both the conv as well as the
     ssm state). If set to 'auto', the data type will be inferred from the model
@@ -214,6 +220,7 @@ class CacheConfig:
             "skip_page_size_padded",
             "user_specified_block_size",
             "user_specified_mamba_block_size",
+            "mamba_large_block_factor",
             "_block_size_resolved",
             # Post-init/derived counters
             "num_gpu_blocks",

@@ -713,6 +713,19 @@ class Platform:
         if not padded_pages:
             return
 
+        # Any block-size bump below invalidates the hierarchical span
+        # (span = factor x block_size, already resolved), whether or not the
+        # mamba page was padded (an exact-fit page leaves
+        # mamba_page_size_padded None but is equally invalidated). Refuse up
+        # front with a clear message rather than surfacing later as a
+        # confusing page-unification failure.
+        # (raise, not assert: must survive python -O)
+        if cache_config.mamba_large_block_factor != 1:
+            raise NotImplementedError(
+                "kv_cache_dtype_skip_layers page packing is unsupported "
+                "with a hierarchical mamba pool (large_block_factor > 1)."
+            )
+
         largest_padded_page = max(padded_pages)
         assert largest_padded_page >= primary_page, (
             f"padded-spec per-token page ({largest_padded_page}B) < primary "
@@ -759,6 +772,8 @@ class Platform:
         # To add the first/last-N sibling:
         #   cache_config.sibling_page_size_padded = shared_page
         if cache_config.mamba_page_size_padded is not None:
+            # Flat pools only (factor > 1 was refused above): repad the
+            # mamba page to the shared page.
             cache_config.mamba_page_size_padded = shared_page
 
     @classmethod
@@ -881,8 +896,16 @@ class Platform:
                 cache_config.block_size,
             )
 
+        # Bump attention block_size up to kernel_block_alignment_size if needed,
+        # but otherwise leave it at the (small) user/default value. Attention no
+        # longer inherits the mamba state size; instead, mamba allocates large
+        # blocks each spanning N small attention blocks.
+        if cache_config.block_size < kernel_block_alignment_size:
+            cache_config.block_size = kernel_block_alignment_size
+
         if cache_config.mamba_cache_mode == "all":
-            # With prefix caching, align to mamba chunk size for kernel perf
+            # With prefix caching, align mamba block size to mamba chunk size
+            # for kernel perf.
             # TODO(tdoublep): this constraint can be relaxed fairly
             # easily by changing the way we layout chunks in the
             # mamba2 kernels.
@@ -890,29 +913,59 @@ class Platform:
             assert base_chunk_size is not None
             attn_tokens_per_mamba_state = cdiv(mamba_page_size, attn_page_size_1_token)
             chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
-            attn_block_size = chunk_size * cdiv(attn_tokens_per_mamba_state, chunk_size)
-            cache_config.mamba_block_size = attn_block_size
+            mamba_block_size_tokens = chunk_size * cdiv(
+                attn_tokens_per_mamba_state, chunk_size
+            )
         else:
-            # Without prefix caching, use minimum block size that satisfies
-            # both backend alignment and mamba page size compatibility
-            attn_block_size = kernel_block_alignment_size * cdiv(
+            # Without prefix caching, use minimum mamba block size that satisfies
+            # both backend alignment and mamba page size compatibility.
+            mamba_block_size_tokens = kernel_block_alignment_size * cdiv(
                 mamba_page_size,
                 kernel_block_alignment_size * attn_page_size_1_token,
             )
 
-        if cache_config.block_size < attn_block_size:
-            cache_config.block_size = attn_block_size
+        if cache_config.mamba_cache_mode == "all":
+            # "All" mode keeps the LEGACY layout: the kernel checkpoints at
+            # the mamba_block_size cadence (chunk_stride math) and the
+            # attention block is inflated to match, so allocation blocks and
+            # state slots stay 1:1 (no hierarchy). Decoupled allocation
+            # (large_block_factor > 1) is align/none-only: composing it with
+            # "all" would need per-boundary state checkpointing across small
+            # blocks that the kernels do not express, and "all" is proposed
+            # for deprecation (#26201).
+            if cache_config.block_size < mamba_block_size_tokens:
+                cache_config.block_size = mamba_block_size_tokens
+            cache_config.mamba_large_block_factor = 1
+            large_block_factor = 1
+            cache_config.mamba_block_size = mamba_block_size_tokens
+        else:
+            # `mamba_block_size_tokens` is a multiple of
+            # kernel_block_alignment_size, which is >= cache_config.block_size
+            # and (since we just bumped) the latter equals
+            # kernel_block_alignment_size, so divisibility holds.
+            assert mamba_block_size_tokens % cache_config.block_size == 0
+            large_block_factor = mamba_block_size_tokens // cache_config.block_size
+            cache_config.mamba_large_block_factor = large_block_factor
+            if cache_config.mamba_cache_mode == "align":
+                # ``mamba_block_size`` is the prefix-cache step granularity;
+                # keep it at the small attention block size so cache hits
+                # land on attention boundaries. In "none" mode keep the
+                # pre-set value (max_model_len: one state block per request).
+                cache_config.mamba_block_size = cache_config.block_size
+
+        if large_block_factor > 1:
             logger.info(
-                "Setting attention block size to %d tokens "
-                "to ensure that attention page size is >= mamba page size.",
-                attn_block_size,
+                "Mamba block spans %d attention blocks of %d tokens "
+                "(mamba_block_size=%d, prefix-cache step=%d).",
+                large_block_factor,
+                cache_config.block_size,
+                mamba_block_size_tokens,
+                cache_config.mamba_block_size,
             )
 
-        if cache_config.mamba_cache_mode == "align":
-            cache_config.mamba_block_size = cache_config.block_size
-
-        # Pad mamba page size to exactly match attention page size
-        attn_page_size = cache_config.block_size * attn_page_size_1_token
+        # Pad mamba page size to exactly match a mamba-sized run of attention
+        # pages so views over the shared backing tensor align byte-exactly.
+        attn_page_size = mamba_block_size_tokens * attn_page_size_1_token
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:

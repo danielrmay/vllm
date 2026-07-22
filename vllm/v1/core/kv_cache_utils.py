@@ -181,6 +181,29 @@ class KVCacheBlockCopy(NamedTuple):
     dst_block_id: int
 
 
+@dataclass(slots=True)
+class LargeBlockMeta:
+    """Hierarchical block-pool metadata.
+
+    Each large block owns N consecutive small blocks with IDs
+    [L*N .. L*N+N-1]. ``num_small_in_use`` counts ref-held smalls; when it
+    drops to 0 on a meta whose cursor has dispensed anything
+    (``next_small_idx > 0``, fully consumed or not), the parent large block
+    is recycled to the free-large queue (``next_small_idx`` reset to 0).
+    Smalls freed within a still-partial meta stay temporarily inaccessible
+    until that recycle — this is the anti-fragmentation guarantee
+    ("a fresh large block per request").
+    """
+
+    # KVCacheBlock with block_id=L (large id); lives in the free-large
+    # queue when ``num_small_in_use == 0 and next_small_idx == 0``.
+    large_block: "KVCacheBlock"
+    # Length-N list of KVCacheBlock with consecutive small ids L*N..L*N+N-1.
+    small_blocks: list["KVCacheBlock"]
+    num_small_in_use: int = 0
+    next_small_idx: int = 0
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python
@@ -1102,7 +1125,16 @@ def unify_kv_cache_spec_page_size(
             # with the main model's attention page size; it is needed here
             # when another layer (e.g. from a draft model) has a larger page
             # than the already-aligned Mamba page.
-            new_spec: KVCacheSpec = replace(layer_spec, page_size_padded=max_page_size)
+            # ``page_size_padded`` is the FULL state page, but this loop
+            # unifies ALLOCATION pages (``page_size_bytes``), which for a
+            # hierarchical mamba spec is state_page // large_block_factor —
+            # so scale the target by the factor (flat pools: factor == 1,
+            # unchanged). Assigning max_page_size directly would under-pad
+            # the state page by the factor and fail the check below.
+            new_spec: KVCacheSpec = replace(
+                layer_spec,
+                page_size_padded=max_page_size * layer_spec.large_block_factor,
+            )
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
         else:
@@ -1884,6 +1916,10 @@ def _max_memory_usage_bytes_from_groups(
     page_size = get_uniform_page_size(
         [group.kv_cache_spec for group in kv_cache_groups]
     )
+    # Small-unit accounting is correct here even under a hierarchical pool:
+    # ``page_size`` is the uniform SMALL page and each spec's
+    # ``max_memory_usage_bytes`` reports bytes, so the quotient counts small
+    # pages regardless of the spec's allocation granularity.
     blocks_needed = sum(
         cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size)
         for group in kv_cache_groups

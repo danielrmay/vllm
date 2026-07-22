@@ -52,7 +52,17 @@ class KVCacheMetricsCollector:
         )
         self.sample_rate = sample_rate
 
-        self.block_metrics: dict[int, BlockMetricsState] = {}
+        # Keyed by object identity (id()), NOT block_id: under a
+        # hierarchical BlockPool (large_block_factor > 1) large and small
+        # block ids share the numeric range, and the pool reports BOTH
+        # granularities here — bare-id keys would overwrite/pop each
+        # other's entries and falsify lifetime/idle/reuse metrics. The
+        # tracked block is stored alongside its state: id() is only unique
+        # among LIVE objects, so the entry must hold a strong reference for
+        # as long as the key is in use. (KVCacheBlock is an eq=True
+        # dataclass and unhashable, so the object cannot key the dict
+        # directly.)
+        self.block_metrics: dict[int, tuple[KVCacheBlock, BlockMetricsState]] = {}
 
         self._eviction_events: list[KVCacheEvictionEvent] = []
 
@@ -61,17 +71,18 @@ class KVCacheMetricsCollector:
 
     def on_block_allocated(self, block: "KVCacheBlock") -> None:
         if self.should_sample_block():
-            self.block_metrics[block.block_id] = BlockMetricsState()
+            self.block_metrics[id(block)] = (block, BlockMetricsState())
 
     def on_block_accessed(self, block: "KVCacheBlock") -> None:
-        metrics = self.block_metrics.get(block.block_id)
-        if metrics:
-            metrics.record_access()
+        entry = self.block_metrics.get(id(block))
+        if entry:
+            entry[1].record_access()
 
     def on_block_evicted(self, block: "KVCacheBlock") -> None:
-        metrics = self.block_metrics.pop(block.block_id, None)
-        if not metrics:
+        entry = self.block_metrics.pop(id(block), None)
+        if not entry:
             return
+        metrics = entry[1]
 
         lifetime = metrics.get_lifetime_seconds()
         idle_time = metrics.get_idle_time_seconds()

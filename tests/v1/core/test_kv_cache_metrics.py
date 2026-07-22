@@ -122,7 +122,7 @@ class TestKVCacheMetricsCollector:
             with patch("time.monotonic_ns", return_value=t):
                 c.on_block_accessed(block)
 
-        assert len(c.block_metrics[0].access_history) == 3
+        assert len(c.block_metrics[id(block)][1].access_history) == 3
 
     def test_evict_no_accesses(self):
         # lifetime should equal idle if never accessed
@@ -166,17 +166,20 @@ class TestKVCacheMetricsCollector:
     def test_reset(self):
         c = KVCacheMetricsCollector(sample_rate=1.0)
 
+        # Keep the blocks alive: entries key on object identity.
+        blocks = [KVCacheBlock(block_id=i) for i in range(5)]
         with patch("time.monotonic_ns", return_value=1000000000):
-            for i in range(5):
-                c.on_block_allocated(KVCacheBlock(block_id=i))
+            for block in blocks:
+                c.on_block_allocated(block)
 
         assert len(c.block_metrics) == 5
         c.reset()
         assert len(c.block_metrics) == 0
 
+        late_block = KVCacheBlock(block_id=10)
         with patch("time.monotonic_ns", return_value=2000000000):
-            c.on_block_allocated(KVCacheBlock(block_id=10))
-        assert 10 in c.block_metrics
+            c.on_block_allocated(late_block)
+        assert id(late_block) in c.block_metrics
 
     def test_huge_time_jump(self):
         c = KVCacheMetricsCollector(sample_rate=1.0)
@@ -222,3 +225,28 @@ def test_kv_cache_metrics_collector_smoke() -> None:
     assert abs(event.idle_seconds - 1.0) < 1e-6
     # One reuse gap between the two accesses.
     assert event.reuse_gaps_seconds == (1.0,)
+
+
+def test_id_collision_between_granularities_does_not_cross_talk():
+    """Hierarchical pools report BOTH large and small blocks, whose numeric
+    ids collide. The collector must key by object identity: a large block
+    with state-slot id 5 and a small attention block with id 5 are
+    different blocks with different lifetimes."""
+    from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+    collector = KVCacheMetricsCollector(sample_rate=1.0)
+    large = KVCacheBlock(5)
+    small = KVCacheBlock(5)
+
+    collector.on_block_allocated(large)
+    collector.on_block_allocated(small)
+    assert len(collector.block_metrics) == 2  # bare-id keying would give 1
+
+    collector.on_block_accessed(large)
+    # Evicting the SMALL block must not pop the large block's state.
+    collector.on_block_evicted(small)
+    assert len(collector.block_metrics) == 1
+    collector.on_block_evicted(large)
+    assert len(collector.block_metrics) == 0
+    assert len(collector._eviction_events) == 2

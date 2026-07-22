@@ -113,7 +113,11 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+    resolve_uniform_cow_page_size,
+)
 
 logger = init_logger(__name__)
 
@@ -411,6 +415,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        # Uniform PER-LAYER page size for worker-side CoW copies, resolved
+        # from leaf specs (a UniformType group's page_size_bytes is a SUM
+        # over members and must not address per-layer tensors); None means
+        # heterogeneous per-layer pages — refuse copies loudly below.
+        # Attention-free models have no KV groups (and no copies): 0.
+        self._cow_uniform_page_size = (
+            resolve_uniform_cow_page_size(kv_cache_config.kv_cache_groups)
+            if kv_cache_config.kv_cache_groups
+            else 0
+        )
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -865,9 +879,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
+            if self._cow_uniform_page_size is None:
+                raise NotImplementedError(
+                    "Partial-hit CoW copies are not supported when KV "
+                    "layers have heterogeneous per-layer page sizes."
+                )
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
+                self._cow_uniform_page_size,
                 scheduler_output.kv_cache_block_copies,
             )
 
